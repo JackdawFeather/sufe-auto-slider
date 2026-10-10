@@ -2,16 +2,51 @@
 
 检测到**上海财经大学统一认证登录页**（login.sufe.edu.cn）时，自动完成「滑块验证 + 登录」，成功后自动跳回原业务系统。
 
+> 本仓库基于 [haohaoo3o/sufe-auto-slider](https://github.com/haohaoo3o/sufe-auto-slider) 改进：
+> 原版滑块为「盲试 X=100/98/102 + 多轮重试」（其 README 认为"图像识别解法不可行"）。
+> 本项目逆向验证了验证码接口行为后，以**卷积+池化 CNN 缺口定位 + 网格探测**重写，实测稳定通过。
+>
 > 仅供本人账号的个人自动化使用。请控制请求频率，遵守学校相关规定；请勿用于他人账号或任何高频、批量场景。
 
-## 功能特性
+## 验证码接口的逆向结论（2026-10 实测）
 
-- 自动检测上财登录页（SPA 渲染完成后触发），右上角浮窗倒计时 4 秒后自动登录，表单打字即自动取消
-- 滑块采用「**候选 X 盲试 + 多轮重试 + 失败退避**」策略：候选 X = 100/98/102，每 token 最多试 3 个，最多 12 轮，退避 1.5s → 4s → 8s（生产环境长期验证；图像识别解法经实验证实不可行）
-- 密码使用服务端下发的 RSA 公钥（PKCS#1 v1.5）加密后传输——浏览器 WebCrypto 不支持 v1.5 填充，扩展内置了一个无依赖的 BigInt 实现（`sufe-crypto.js`）
-- 浮窗滚动显示每轮滑块尝试结果；弹窗提供「测试滑块」（等价于命令行脚本的 `test`，不提交账号）
-- 密码仅保存在本机 `chrome.storage.local`，不上传、不进浏览器同步；扩展只向 `login.sufe.edu.cn` 提交数据
-- 登录成功后 20 秒内不重复触发（防跳转异常导致自动登录死循环）
+1. `sliderCaptcha/check?X=&Y=&token=` **只校验落点 (X, Y)，不校验滑动轨迹、速度、时长**——不渲染滑块 UI、直接按坐标调用接口即可通过。
+2. 缺口在背景图中被渲染为**纯白色拼图形状**；拼图块 alpha 轮廓与该白色缺口形状一致（对齐 IoU≈0.98），图像定位完全可行。
+3. 坐标映射（已实测验证）：
+   - `Y` = 缺口顶边的图像像素 y（接口直接下发，回传即可）；
+   - `X` = 缺口白色轮廓左边缘 x − 拼图块在自身 100×100 图像内的左边距（本仓库全部采集样本中该边距恒为 2px）。
+4. 服务端对 X 的**容差为 ±2px**（`[X_ans-2, X_ans+2]`，上下边界均已在线上逐个探测确认）。
+5. **check 失败不会作废 token**：同一 token 可多次提交 X 探测（已线上验证），这为"预测+网格探测"策略提供了兜底。
+6. 背景图尺寸随机（采样中见 460×254 ~ 594×360 共 6 种），拼图块恒为 100×100。
+
+## 滑块策略（重写后）
+
+1. `POST sliderCaptcha/init` 获取背景图（base64 PNG，含 `Y` 与 `token`）；
+2. Canvas 解码 → `sufe-cnn.js`（纯 JS 前向，无依赖）预测缺口左边缘 x；
+3. 以预测值为中心按 2px 间隔做**网格探测**：先 `0,±2,±4,±6` 再 `±1,±3,±5,±7`，覆盖 ±8px——即使 CNN 有数像素误差也必定命中；
+4. 全部未命中则换 token 重试（最多 6 轮）；CNN 不可用时退化为旧版盲试候选（100/98/102）。
+
+原版盲试策略之所以"能用"，是因为该验证码缺口位置分布强烈偏置在 x≈100 附近（采样中约 1/4 直接落在候选点上），多轮重试后大概率蒙中——本质是概率，而新策略是确定性的。
+
+## CNN 设计与训练
+
+- **结构**（`sufe-cnn.js`）：`Conv3x3+ReLU → MaxPool(2,1)` ×4 → `Conv1x1` → x 方向 248 维热图 → softmax → soft-argmax 回归缺口左边缘；输入 248×128（原图等比缩放）。
+- **训练数据**：`tools/fetch_samples.py` 从线上采集 400 张真实验证码；标签由 `tools/detect_gap.py` 教师检测器（白色连通域 + 拼图块掩码 IoU 对齐）自动生成；轻量增强（亮度/对比度/噪声/模糊/±平移）。
+- **离线指标**：留出集（49 张）MAE 0.79px、≤2px 命中 98%、最大误差 3.98px（完整数据见 `output/eval.json`）。
+- **权重**：`tools/train_cnn.py` 训练后导出 `sufe-cnn-weights.js`（base64 f32），浏览器端零依赖、单张推理 <0.5s。
+
+## 实测结果（真实接口）
+
+| 项目 | 结果 |
+|---|---|
+| 留出集缺口定位（49 张未参与训练） | MAE **0.79px**，≤2px 命中 **98%**，最大误差 3.98px |
+| JS/Python 推理一致性（60 张逐层对比） | 平均偏差 **0.004px**，最大 0.012px；纯 JS 单张推理约 0.4s |
+| 全链路闭环（`tools/e2e_dummy_login.py`，假学号） | doLogin 返回 `SSO10001 账号不存在`——**vcode 被真实接受**，仅凭据被拒 |
+| 真实浏览器 15 轮（`tools/browser_solve_test.js`，页面内真实 canvas+fetch 路径） | **14/15** 首 token 通过（其中 13 次第 1 探测命中、1 次第 3 探测命中）；1 次未中→按扩展逻辑换 token 重试即过 |
+| 线上实测（`tools/live_eval.py`，15 个新 token） | **15/15 通过**，14 次首次探测命中，平均 1.13 次；CNN 误差 MAE 0.98px；对照旧盲试策略同批仅 4/15 会通过 |
+| 真实 Chrome 扩展内实测（`tools/ext_browser_test.js`，独立配置） | 扩展加载→浮窗倒计时→**CNN 首次探测解锁滑块**（统计 n=1/firstTry=1，X=260）→ doLogin 因假学号被拒（SSO10001，预期）；浮窗截图 `output/ext_test_widget.png` |
+
+说明：极端图像（如大面积白雪与缺口相邻）偶尔会让 CNN 误差超过网格覆盖的 ±8px（15 轮中出现 1 次）。扩展对此的兜底是换 token 重试（最多 6 轮），因此单次登录仍等效于必过；对照旧盲试策略单 token 仅约 24% 命中率。
 
 ## 安装（开发者模式加载）
 
@@ -27,15 +62,29 @@
 ```
 ① GET  /api/v3/auth/queryAllValid        → RSA 公钥 + publicKeyId + loginTicket
 ② POST /api/v3/sliderCaptcha/init        → 背景/滑块图 + Y + token
-③ GET  /api/v3/sliderCaptcha/check       → 盲试 X=100/98/102，通过得 vcode
+③ 背景图 → CNN 缺口定位 → 网格探测 check → 通过得 vcode
 ④ POST /api/v3/auth/doLogin              → 学号 + RSA 加密密码 + vcode → 会话 Cookie
 ```
 
-登录成功后优先读取 `doLogin` 响应中的跳转地址，否则重载当前 URL 由 SSO 续跳（保留 service 参数）。
+密码使用服务端下发的 RSA 公钥（PKCS#1 v1.5）加密后传输——浏览器 WebCrypto 不支持 v1.5 填充，扩展内置了一个无依赖的 BigInt 实现（`sufe-crypto.js`）。
+
+## 工具链（tools/）
+
+| 脚本 | 用途 |
+|---|---|
+| `fetch_samples.py` | 从线上采集验证码样本（bg/piece/meta） |
+| `detect_gap.py` | 教师检测器：白色缺口连通域 + 拼图块 IoU 对齐 → 标签 |
+| `train_cnn.py` | 训练 GapNet 并导出 `sufe-cnn-weights.js`、评估指标 |
+| `probe_check.py` / `probe_tolerance.py` / `probe_edge.py` | 接口行为探测（映射、容差、token 语义） |
+| `live_eval.py` | 线上通过率实测（网格探测），并对比旧盲试策略 |
+| `e2e_dummy_login.py` | 假账号全链路闭环（验证 vcode 被 doLogin 接受） |
+| `dump_test.py` + `parity_test.js` | JS 与 Python 推理数值一致性测试 |
+| `browser_solve_test.js` | 在真实登录页执行的浏览器端求解脚本 |
 
 ## 配置调整
 
-候选 X / 轮数等常量集中在 `content.js` 顶部（`X_CANDIDATES` / `MAX_ROUNDS` 等），修改后在 `chrome://extensions` 中点扩展的「重新加载」即可生效。
+- 网格/轮数等常量集中在 `content.js` 顶部（`CNN_GRID` / `MAX_ROUNDS`），修改后 `chrome://extensions` 重新加载即可。
+- 重新训练模型：`cd tools && python train_cnn.py 130 1.5`，然后 `node parity_test.js` 验证，权重更新到根目录 `sufe-cnn-weights.js`。
 
 ## 排障
 
@@ -43,7 +92,8 @@
 |---|---|
 | 浮窗没出现 | 确认地址栏是 `login.sufe.edu.cn` 且页面已渲染出登录框（SPA 最长等待 20 秒） |
 | 「学号或密码错误（SSO10002）」 | 在扩展弹窗中更正账号信息 |
-| 多轮「滑块未通过」 | 多为风控收紧期，不要死磕，隔几小时/隔天恢复；可先用弹窗「测试滑块」确认 |
+| 「账号不存在（SSO10001）」 | 学号填错 |
+| 滑块多轮未通过 | 验证码接口若改版（图像风格/坐标规则变化），先用弹窗「测试滑块」看浮窗日志中的 CNN 预测与置信度，必要时重采样本重训 |
 | 登录成功但页面没跳走 | 浮窗会提示，手动刷新或重新进入业务系统即可 |
 
 ## 贡献与反馈

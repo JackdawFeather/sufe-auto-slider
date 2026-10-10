@@ -4,3 +4,9 @@ desktop.ini
 *.zip
 *.crx
 *.pem
+
+# 采集样本与训练产物（可由 tools/fetch_samples.py 重新采集生成）
+samples/
+output/
+__pycache__/
+*.pyc

@@ -1,8 +1,13 @@
 /*
  * 上财自动滑块 · 内容脚本
- * 检测到上财统一认证登录页后：倒计时 → 自动「滑块盲试 + 登录」→ 跳转。
- * 策略沿用生产环境长期验证的「候选 X 盲试 + 多轮重试 + 失败退避」：
- *   候选 X = 100/98/102，每个 token 最多试 3 个，最多 12 轮，退避 1.5s/4s/8s。
+ * 检测到上财统一认证登录页后：倒计时 → 自动「CNN 缺口定位 + 登录」→ 跳转。
+ *
+ * 滑块策略（2026-10 逆向后重写）：
+ *   验证码接口只校验 X/Y 落点，不校验滑动轨迹/速度；缺口在背景图中渲染为
+ *   纯白色拼图形状，X = 缺口白色轮廓左边缘的像素坐标，容差 ±2。
+ *   因此用「卷积+池化」小网络（sufe-cnn.js，纯 JS 前向）从背景图定位缺口左边缘，
+ *   再以预测值为中心做间隔 2px 的网格探测（验证码失败不销毁 token）：
+ *   即使预测有 ±8px 误差也必定命中。CNN 不可用时退化为旧的盲试候选。
  * 仅向 login.sufe.edu.cn 提交数据，密码 RSA(PKCS#1 v1.5) 加密后传输。
  */
 (async function () {
@@ -10,11 +15,13 @@
   if (window.__SUFE_AUTO_SLIDER__) return;
   window.__SUFE_AUTO_SLIDER__ = true;
 
-  // ── 常量（与生产脚本一致，一般无需修改） ────────────────────────────
+  // ── 常量（一般无需修改） ────────────────────────────────────────────
   const BASE = 'https://login.sufe.edu.cn/esc-sso';
-  const X_CANDIDATES = [100, 98, 102];
-  const MAX_X_PER_ROUND = 3;
-  const MAX_ROUNDS = 12;
+  // 以 CNN 预测值为中心的探测网格：先粗后细，覆盖 ±8px（服务端容差 ±2px）
+  const CNN_GRID = [0, 2, -2, 4, -4, 6, -6, 1, -1, 3, -3, 5, -5, 7, -7];
+  // CNN 不可用时的保底盲试候选（历史经验值）
+  const LEGACY_X_CANDIDATES = [100, 98, 102];
+  const MAX_ROUNDS = 6;
   const AUTO_DELAY_MS = 4000;      // 检测到登录页后的倒计时，给用户留取消窗口
   const LOOP_GUARD_MS = 20000;     // 自动登录成功后 20s 内不再自动启动（防死循环）
   const CFG_KEY = 'sufeAutoSliderCfg';
@@ -49,22 +56,71 @@
     }
   }
 
-  // ── 滑块与登录核心（移植自生产脚本） ────────────────────────────────
-  async function sliderRound() {
+  // ── 滑块核心：CNN 定位缺口 → 网格探测 ──────────────────────────────
+  const STATS_KEY = 'sufeAutoSliderStats';
+
+  async function recordStat(firstTry, X, conf) {
+    try {
+      const o = await chrome.storage.local.get(STATS_KEY);
+      const s = o[STATS_KEY] || { n: 0, firstTry: 0 };
+      s.n++; if (firstTry) s.firstTry++;
+      s.lastX = X;
+      s.lastConf = (conf == null) ? null : Math.round(conf * 1000) / 1000;
+      await chrome.storage.local.set({ [STATS_KEY]: s });
+    } catch (e) { /* 统计失败不影响流程 */ }
+  }
+
+  // base64 PNG → 原始 RGB 字节（与训练端一致，不做浏览器重采样）
+  async function decodePngBase64(b64) {
+    const img = new Image();
+    img.src = 'data:image/png;base64,' + b64;
+    if (img.decode) await img.decode();
+    else await new Promise((res, rej) => { img.onload = res; img.onerror = rej; });
+    const cv = document.createElement('canvas');
+    cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0);
+    const im = ctx.getImageData(0, 0, cv.width, cv.height);
+    return { data: im.data, w: cv.width, h: cv.height };
+  }
+
+  async function guessBaseX(d) {
+    // 返回 { x, conf } 或 null（CNN 不可用时退化为 null）
+    if (typeof SufeCNN === 'undefined' || !d.sourceImage) return null;
+    try {
+      const im = await decodePngBase64(d.sourceImage);
+      const r = SufeCNN.locate(im.data, im.w, im.h);
+      if (!isFinite(r.x)) return null;
+      return { x: Math.round(r.x), conf: r.conf };
+    } catch (e) { return null; }
+  }
+
+  async function sliderRound(ui) {
     const init = await api('/api/v3/sliderCaptcha/init', { method: 'POST', body: {} });
     const d = init && init.data;
     if (!d || !d.token) throw new Error('滑块 init 失败：' + ((init && init.msg) || '未知错误'));
     const y = d.Y, token = d.token;
     let lastMsg = (init && init.msg) || '';
-    for (const x of X_CANDIDATES.slice(0, MAX_X_PER_ROUND)) {
+    const guess = await guessBaseX(d);
+    const xs = guess ? CNN_GRID.map((o) => guess.x + o).filter((v) => v >= 0) : LEGACY_X_CANDIDATES;
+    let tries = 0;
+    for (const x of xs) {
+      tries++;
       const r = await api(
         '/api/v3/sliderCaptcha/check?X=' + encodeURIComponent(x) +
         '&Y=' + encodeURIComponent(y) + '&token=' + encodeURIComponent(token)
       );
-      if (String(r.code) === '0') return { vcode: r.data, x: x, y: y };
+      if (String(r.code) === '0') {
+        recordStat(tries === 1, x, guess && guess.conf);
+        return { vcode: r.data, x: x, y: y, baseX: guess && guess.x, conf: guess && guess.conf, tries: tries };
+      }
       lastMsg = r.msg || lastMsg;
     }
-    return { vcode: null, lastMsg: lastMsg };
+    (ui && ui.note || (() => {}))(
+      guess ? ('本轮未命中（CNN 预测 X≈' + guess.x + '，conf=' + (guess.conf || 0).toFixed(2) + '，已探 ' + tries + ' 点）')
+            : ('CNN 不可用，本轮盲试 ' + tries + ' 点未命中')
+    );
+    return { vcode: null, lastMsg: lastMsg, baseX: guess && guess.x, conf: guess && guess.conf };
   }
 
   async function testSlider(rounds) {
@@ -72,7 +128,10 @@
     for (let rnd = 1; rnd <= rounds; rnd++) {
       try {
         const v = await sliderRound();
-        if (v.vcode) return { ok: true, detail: '第 ' + rnd + ' 轮通过（X=' + v.x + ' Y=' + v.y + '）' };
+        if (v.vcode) {
+          return { ok: true, detail: '第 ' + rnd + ' 轮通过（X=' + v.x + ' Y=' + v.y +
+            (v.baseX != null ? '，CNN 预测 ' + v.baseX + '（conf=' + (v.conf || 0).toFixed(2) + '），第 ' + v.tries + ' 次探测命中' : '，盲试命中') + '）' };
+        }
         log.push('第 ' + rnd + ' 轮未通过（' + (v.lastMsg || '无信息') + '）');
       } catch (e) { log.push('第 ' + rnd + ' 轮异常：' + e.message); }
       if (rnd < rounds) await sleep(backoff(rnd));
@@ -111,7 +170,7 @@
       checkStop();
       ui.status('滑块解锁中（第 ' + rnd + '/' + MAX_ROUNDS + ' 轮）…');
       let v;
-      try { v = await sliderRound(); }
+      try { v = await sliderRound(ui); }
       catch (e) { ui.note('init 异常：' + e.message); await sleep(backoff(rnd)); continue; }
       if (!v.vcode) {
         ui.note('第 ' + rnd + ' 轮未通过（' + (v.lastMsg || '无信息') + '）');
@@ -119,7 +178,7 @@
         continue;
       }
       checkStop();
-      ui.status('滑块已解锁（X=' + v.x + '），正在登录…');
+      ui.status('滑块已解锁（X=' + v.x + (v.conf != null ? '，置信度 ' + Number(v.conf).toFixed(2) : '') + '），正在登录…');
       const res = await api('/api/v3/auth/doLogin', {
         method: 'POST',
         body: {
@@ -139,8 +198,11 @@
         await chrome.storage.local.set({ [STATE_KEY]: { lastAutoLoginAt: Date.now() } });
         return res;
       }
-      if (res.code === 'SSO10002') {
-        const err = new Error('学号或密码错误（SSO10002），请在扩展设置中更正');
+      if (res.code === 'SSO10002' || res.code === 'SSO10001') {
+        const msg = res.code === 'SSO10001'
+          ? '学号不存在（SSO10001），请在扩展设置中更正'
+          : '学号或密码错误（SSO10002），请在扩展设置中更正';
+        const err = new Error(msg);
         err.stopRetry = true;
         throw err;
       }
