@@ -22,7 +22,7 @@
   // CNN 不可用时的保底盲试候选（历史经验值）
   const LEGACY_X_CANDIDATES = [100, 98, 102];
   const MAX_ROUNDS = 6;
-  const AUTO_DELAY_MS = 4000;      // 检测到登录页后的倒计时，给用户留取消窗口
+  const AUTO_DELAY_MS = 1500;      // 检测到登录页后的倒计时（低时延，仅留极短取消窗口）
   const LOOP_GUARD_MS = 20000;     // 自动登录成功后 20s 内不再自动启动（防死循环）
   const CFG_KEY = 'sufeAutoSliderCfg';
   const STATE_KEY = 'sufeAutoSliderState';
@@ -330,9 +330,9 @@
 
   async function startCountdown(cfg) {
     state = 'pending';
-    let remain = Math.round(AUTO_DELAY_MS / 1000);
+    let remainMs = AUTO_DELAY_MS;
     const card = () => renderCard(
-      '检测到上财登录页，' + remain + ' 秒后自动登录（' + cfg.username + '）',
+      '检测到上财登录页，' + (remainMs / 1000).toFixed(1) + ' 秒后自动登录（' + cfg.username + '）',
       [
         mkBtn('立即登录', () => startFlow(), true),
         mkBtn('取消', () => { stopRun(); renderManual(); }),
@@ -340,10 +340,10 @@
     );
     card();
     countdownTimer = setInterval(() => {
-      remain--;
-      if (remain <= 0) { clearInterval(countdownTimer); countdownTimer = null; startFlow(); return; }
+      remainMs -= 500;
+      if (remainMs <= 0) { clearInterval(countdownTimer); countdownTimer = null; startFlow(); return; }
       card();
-    }, 1000);
+    }, 500);
   }
 
   function renderManual() {
@@ -376,11 +376,16 @@
     return null;
   }
 
-  // ── 消息：来自 popup 的「测试滑块」 ─────────────────────────────────
+  // ── 消息：来自 popup 的「测试滑块」「登录」 ─────────────────────────
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg && msg.type === 'SUFE_TEST_SLIDER') {
       testSlider(3).then(sendResponse);
       return true;
+    }
+    if (msg && msg.type === 'SUFE_RUN_NOW') {
+      startFlow();
+      sendResponse({ ok: true });
+      return false;
     }
   });
 
@@ -389,8 +394,18 @@
   const form = await waitForForm(20000);
   if (!form) return; // 不是登录页（或页面已跳转/渲染失败），静默退出
 
-  document.addEventListener('focusin', onUserInteract, true);
+  // 仅"真实互动"才取消倒计时：鼠标/触摸按下或输入。
+  // 不监听 focusin——关闭浏览器翻译弹窗等场景会让输入框重新获得焦点，
+  // 只产生 focusin 而无 pointerdown/input，会被误判为手动操作而取消自动登录。
+  document.addEventListener('pointerdown', onUserInteract, true);
   document.addEventListener('input', onUserInteract, true);
+
+  // 弹窗「登录」按钮走免刷新注入路径时携带此标记：跳过倒计时与各项拦截，立即开始
+  if (window.__SUFE_RUN_NOW__) {
+    delete window.__SUFE_RUN_NOW__;
+    startFlow();
+    return;
+  }
 
   const st = await getState();
   if (st.lastAutoLoginAt && Date.now() - st.lastAutoLoginAt < LOOP_GUARD_MS) {
