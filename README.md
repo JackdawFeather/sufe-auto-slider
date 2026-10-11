@@ -6,11 +6,12 @@
 
 ## 功能特性
 
-- 自动检测上财登录页（SPA 渲染完成后触发），右上角浮窗倒计时 4 秒后自动登录，表单打字即自动取消
-- 滑块缺口识别采用**轻量全卷积 CNN**（conv → relu → maxpool → conv → 列池化 → 1x1 conv，约 4.4k 参数，纯 JS 前向、无依赖）：取背景图缺口纵带 → 统一宽度 512 → 2x2 下采样 → 输出 128 列 softmax 定位缺口横坐标；训练数据为真实验证码 + 服务端渲染缺口的精确分割标注
-- CNN 之外保留两级兜底：经典「平坦高亮低饱和连通块」分割 → 盲试候选 X；候选梯队在同一 token 内依次尝试，通常**一次通过**
+- 自动检测上财登录页（SPA 渲染完成后触发），右上角浮窗倒计时 4 秒后自动登录；在表单里点击/打字即取消（只认 pointerdown/input，关闭浏览器翻译弹窗等只会引起 focusin 的场景不会误取消）
+- 滑块缺口识别采用**整图输入的轻量 CNN**（4×[Conv3x3+ReLU → 高度方向 MaxPool] → 1x1 conv → 256 列 softmax → soft-argmax，约 2.2 万参数，纯 JS 前向、零依赖）：背景图不做裁剪，直接 area-resize 到 256×128 归一化后整图推理，回归「可通过窗口中心」；训练数据为真实验证码 + 服务端渲染缺口的精确分割标注
+- 服务端**容差实测**：可通过窗口恒为 5 个连续整数（中心 = 缺口左缘 − 3，两侧各 ±2px）；预测值四舍五入即 X，先试 0/±1/±2 即覆盖全部余量
+- 三级兜底：CNN → CNN 邻域 → 经典「平坦纯白连通块」分割及邻域 → 历史盲试候选；失败不作废 token，同一 token 内连续校验，通常**首探测一次通过**
 - 密码使用服务端下发的 RSA 公钥（PKCS#1 v1.5）加密后传输——浏览器 WebCrypto 不支持 v1.5 填充，扩展内置了一个无依赖的 BigInt 实现（`sufe-crypto.js`）
-- 浮窗滚动显示每轮滑块尝试结果（含识别方式/CNN 置信度/分割坐标）；弹窗提供「测试滑块」（不提交账号）
+- 浮窗滚动显示每轮滑块尝试结果（含识别方式/CNN 置信度/分割坐标）；弹窗提供「登录」（当前页直接执行，页面未注入脚本时自动注入、免刷新）与「测试滑块」（不提交账号）、密码显隐、历史首探命中率统计
 - 闭环自检：访问 `login.sufe.edu.cn/login/#sufe-test-slider` 只跑滑块验证并在浮窗显示结果，不触碰账号密码
 - 密码仅保存在本机 `chrome.storage.local`，不上传、不进浏览器同步；扩展只向 `login.sufe.edu.cn` 提交数据
 - 登录成功后 20 秒内不重复触发（防跳转异常导致自动登录死循环）
@@ -29,24 +30,30 @@
 ```
 ① GET  /api/v3/auth/queryAllValid        → RSA 公钥 + publicKeyId + loginTicket
 ② POST /api/v3/sliderCaptcha/init        → 背景图 sourceImage + 滑块图 newImage + Y + token
-③ CNN  背景图纵带 → conv/pool 列分类      → 缺口横坐标 X（natual px，= 缺口左缘 - 2）
+③ CNN  整图 → area-resize 256x128 → conv/pool → soft-argmax → 可通过窗口中心 X
 ④ GET  /api/v3/sliderCaptcha/check       → X/Y/token 校验，通过得 vcode（失败 token 仍可用，可换候选重试）
 ⑤ POST /api/v3/auth/doLogin              → 学号 + RSA 加密密码 + vcode → 会话 Cookie
 ```
 
 X 坐标约定来自登录页前端源码：`X = 拖动左偏移(显示px) × imgScale`，`imgScale = 背景图自然宽 / 显示宽`，
-故 X 为**背景图自然像素**坐标；背景图宽度不固定（460–594），识别前统一为 512（裁剪/reflect 补齐，不缩放）。
+故 X 为**背景图自然像素**坐标；背景图尺寸随机（宽 460–594、高 252–360），整图缩放到固定 256×128 后推理，输出再按宽度比例换算回原图。
+
+**可通过窗口（实测）**：以「缺口左缘」为基准，服务端只接受 `左缘−5 … 左缘−1` 共 5 个整数（即中心 = 左缘−3、半径 ±2）。
+模型直接回归窗口中心，四舍五入即命中；即使预测偏 ±2px 仍在窗口内。
 
 登录成功后优先读取 `doLogin` 响应中的跳转地址，否则重载当前 URL 由 SSO 续跳（保留 service 参数）。
 
 ## 模型与训练（`lab/` 目录，随仓库提供，不进扩展包）
 
-- `harvest.py` 拉取真实验证码并用「缺口=平坦纯白连通块」精确标注 X；`train.py` 训练 `cnn.py` 中的全卷积网络（numpy 手写 conv/pool 反向）
-- `export_js.py` 导出 `sufe-cnn-weights.js`；`parity.js`（Node）校验 JS 前向与 Python 前向逐样本一致；`gradcheck.py` 校验反向；`live_test.py` 在线闭环验证识别→校验通过率
+- 采集：`harvest2.py` 拉取真实验证码，整图存 `samples/full/`，并用「缺口 = 平坦纯白连通块」给出精确标签（`harvest.py` 为早期版本，存缺口横带）
+- 训练：`train2.py`（整图输入 256×128、4 级 Y 池化、soft-argmax；numpy 手写 conv/pool/maxpoolY2 反向，仅依赖 numpy+PIL）；`cnn.py` 是层与反向实现，`resize.py` 是与 JS 等价的 area 缩放
+- 校验：`gradcheck.py` 反向数值校验；`parity2.py` + `parity2.js` 校验 JS 与 numpy 前向逐样本一致；`live_eval2.py` 在线闭环评测（首探命中率/误差）
+- 接口行为：`probe_tolerance.py` 实测可通过窗口与 token 语义（失败不作废 token）
+- 打包：`build_dist.py` 生成 zip+crx；`release.py` 建 GitHub Release 并传附件
 
 ## 配置调整
 
-轮数等常量集中在 `content.js` 顶部（`MAX_ROUNDS` 等）；盲试兜底候选为 `X_CANDIDATES`（仅在 CNN 与分割都失败时使用）。修改后在 `chrome://extensions` 中点扩展的「重新加载」即可生效。
+轮数等常量集中在 `content.js` 顶部（`MAX_ROUNDS` / `BLIND_X` 等）；盲试候选仅在识别与分割都失败时使用。修改后在 `chrome://extensions` 中点扩展的「重新加载」即可生效。
 
 ## 排障
 
@@ -59,14 +66,22 @@ X 坐标约定来自登录页前端源码：`X = 拖动左偏移(显示px) × im
 
 ## 更新日志
 
+### v2.2.0 (2026-10-11)
+
+- **模型换代：整图输入**。不再裁剪缺口横带，而是把背景图整体 area-resize 到 256×128 后推理（4×[Conv3x3+ReLU → 高度方向 MaxPool] → 1×1 conv → 256 列 softmax → soft-argmax），参数量 4.4k → 2.2 万，对背景纹理/亮度变化更鲁棒
+- **直接回归「可通过窗口中心」**：实测窗口恒为 `缺口左缘−5 … 左缘−1`（中心 左缘−3、半径 ±2），预测值四舍五入即命中，两侧余量对称；不再依赖「预测缺口左缘再减 2」的换算
+- **合并 v2.1.0 分支的交互改进**：只认 pointerdown/input 取消倒计时（浏览器翻译弹窗焦点变化不再误取消）、弹窗「登录」支持免刷新注入（`scripting` 权限）、密码显示/隐藏、成功统计（首探命中率）、`SSO10001`（学号不存在）提示
+- 训练数据扩到 ~400 张整图（`lab/harvest2.py`），增强加入「缺口改色 + 亮块干扰」针对性对抗雪白背景误判；标签用 `lab/regen_meta.py` 从图像重建，保证与文件一一对应
+- 训练在**上财匡时一号算力平台（A40 GPU）**完成：`lab/train2_torch.py`（torch/oneDNN，600 epoch ≈ 2.5 min），CPU 版 numpy 实现（`train2.py`）保留作离线核验
+- **实测（本版）**：留出集 76 张 MAE **0.55px**、≤2px **99%**、max 5.7px；JS↔torch 前向一致（1.8e-3px）；线上 12/12 首探测通过；真实浏览器（登录页内注入出货版 JS）5/5 首探测通过、单张推理 ~1.0s
+- 坐标与容差结论、token 语义（失败不作废）已用 `lab/probe_tolerance.py` 线上实测并写入文档
+- 致谢：整图输入与部分交互改进的思路来自社区 v2.1.0 分支，本仓库对其重新实现、重训模型并做了窗口中心标签与梯队收敛
+
 ### v2.0.0 (2026-10-11)
 
-- **缺口识别换用 CNN**：轻量全卷积网络（conv3×3 → ReLU → MaxPool → conv3×3 → 列 max-pool → 1×1 conv，128 列 softmax，约 4.4k 参数，纯 JS 前向零依赖）直接从背景图定位缺口横坐标，替代 v1 的「盲试候选 X」
-- 坐标映射确认：`X = 缺口左缘 − 2`（背景图自然像素）；背景图尺寸不固定（宽 460–594），统一 512 后识别，并对不可能位置做列屏蔽
-- 候选梯队改为：CNN → 经典分割兜底 → ±1/±2 邻域 → 盲试（同一 token 可连续校验，无需重开）
-- 新增闭环自检入口：`login.sufe.edu.cn/login/#sufe-test-slider`（只跑滑块验证，不提交账号）
-- 开源训练管线 `lab/`：采集 → 精确标注 → 训练 → 导出 JS 权重 → JS/Python 前向一致性校验 → 在线通过率验证
-- 实测：在线 15/15、真实浏览器内 5/5 **一次通过**（首候选即 CNN 结果，误差 ≤1px）
+- 缺口识别换用轻量全卷积 CNN（缺口横带输入，约 4.4k 参数，纯 JS 前向），替代 v1 的「盲试候选 X」
+- 候选梯队：CNN → 经典分割兜底 → ±1/±2 邻域 → 盲试；同一 token 可连续校验
+- 新增闭环自检入口 `#sufe-test-slider`；开源训练管线 `lab/`
 
 ### v1.0.0 (2026-10-08)
 

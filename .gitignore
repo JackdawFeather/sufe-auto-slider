@@ -16,3 +16,7 @@ lab/login.html
 
 # 构建产物（dist 与签名密钥不进仓库）
 dist/
+
+# 整图样本与训练产物（可由 lab/harvest2.py 重新采集生成）
+lab/samples/
+lab/output/

@@ -15,7 +15,8 @@ RNG = np.random.default_rng(7)
 # ───────────────────────── primitives ─────────────────────────
 def im2col(x, kh, kw, sh, sw, ph, pw):
     n, c, h, w = x.shape
-    xp = np.pad(x, ((0, 0), (0, 0), (ph, ph), (pw, pw)), mode="edge")
+    # 零填充（与 torch Conv2d padding=1 及扩展 JS 端一致）
+    xp = np.pad(x, ((0, 0), (0, 0), (ph, ph), (pw, pw)), mode="constant")
     oh = (h + 2 * ph - kh) // sh + 1
     ow = (w + 2 * pw - kw) // sw + 1
     cols = np.empty((n, oh, ow, c, kh, kw), dtype=x.dtype)
@@ -34,17 +35,8 @@ def col2im_add(grad_cols, shape, kh, kw, sh, sw, ph, pw, oh, ow):
         for j in range(kw):
             gp[:, :, i:i + sh * oh:sh, j:j + sw * ow:sw] += v[:, :, :, :, i, j]
     if ph or pw:
-        # edge 填充的梯度折回边界像素（与 forward 的 np.pad(mode='edge') 对应）
-        gx = gp[:, :, ph:ph + h, pw:pw + w].copy()
-        gx[:, :, 0, :] += gp[:, :, :ph, pw:pw + w].sum(2)
-        gx[:, :, h - 1, :] += gp[:, :, ph + h:, pw:pw + w].sum(2)
-        gx[:, :, :, 0] += gp[:, :, ph:ph + h, :pw].sum(3)
-        gx[:, :, :, w - 1] += gp[:, :, ph:ph + h, pw + w:].sum(3)
-        gx[:, :, 0, 0] += gp[:, :, :ph, :pw].sum((2, 3))
-        gx[:, :, 0, w - 1] += gp[:, :, :ph, pw + w:].sum((2, 3))
-        gx[:, :, h - 1, 0] += gp[:, :, ph + h:, :pw].sum((2, 3))
-        gx[:, :, h - 1, w - 1] += gp[:, :, ph + h:, pw + w:].sum((2, 3))
-        return gx
+        # 零填充：填充位不参与梯度回传，直接裁掉
+        return gp[:, :, ph:ph + h, pw:pw + w]
     return gp
 
 
@@ -102,6 +94,23 @@ class MaxPool2:
         out = np.zeros((n, c, h // 2, w // 2, 4), dtype=g.dtype)
         np.put_along_axis(out, self.idx[..., None], g[..., None], -1)
         return out.reshape(n, c, h // 2, w // 2, 2, 2).transpose(0, 1, 2, 4, 3, 5).reshape(n, c, h, w)
+
+
+class MaxPoolY2:
+    """仅在高度方向 2x2 池化（步长2，宽度不变）：(n,c,h,w) -> (n,c,h/2,w)。"""
+
+    def forward(self, x):
+        n, c, h, w = x.shape
+        self.shape = x.shape
+        xr = x.reshape(n, c, h // 2, 2, w)
+        self.idx = xr.argmax(3)                       # (n,c,h/2,w)
+        return np.take_along_axis(xr, self.idx[:, :, :, None, :], 3)[:, :, :, 0, :]
+
+    def backward(self, g):
+        n, c, h, w = self.shape
+        out = np.zeros((n, c, h // 2, 2, w), dtype=g.dtype)
+        np.put_along_axis(out, self.idx[:, :, :, None, :], g[:, :, :, None, :], 3)
+        return out.reshape(n, c, h, w)
 
 
 class MaxPoolRows:

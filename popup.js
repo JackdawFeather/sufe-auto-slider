@@ -1,11 +1,15 @@
 const CFG_KEY = 'sufeAutoSliderCfg';
+const LOGIN_URL_PREFIX = 'https://login.sufe.edu.cn/';
 
 const $username = document.getElementById('username');
 const $password = document.getElementById('password');
+const $togglePwd = document.getElementById('togglePwd');
 const $enabled = document.getElementById('enabled');
 const $save = document.getElementById('save');
+const $login = document.getElementById('login');
 const $test = document.getElementById('test');
 const $status = document.getElementById('status');
+const $stats = document.getElementById('stats');
 
 function setStatus(text, isErr) {
   $status.textContent = text;
@@ -17,6 +21,20 @@ chrome.storage.local.get(CFG_KEY).then((o) => {
   $username.value = cfg.username || '';
   $password.value = cfg.password || '';
   $enabled.checked = cfg.enabled !== false;
+});
+
+chrome.storage.local.get('sufeAutoSliderStats').then((o) => {
+  const s = o.sufeAutoSliderStats;
+  if (s && s.n) {
+    $stats.textContent = `历史滑块统计：${s.n} 次成功，${s.firstTry} 次首次命中（${Math.round(s.firstTry / s.n * 100)}%）`;
+  }
+});
+
+$togglePwd.addEventListener('click', () => {
+  const show = $password.type === 'password';
+  $password.type = show ? 'text' : 'password';
+  $togglePwd.textContent = show ? '隐藏' : '显示';
+  $togglePwd.title = show ? '隐藏密码' : '显示密码';
 });
 
 $save.addEventListener('click', async () => {
@@ -33,9 +51,43 @@ $save.addEventListener('click', async () => {
   setStatus('已保存 ✓ 刷新上财登录页即可自动登录。');
 });
 
-$test.addEventListener('click', async () => {
+async function activeLoginTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.url || !tab.url.startsWith('https://login.sufe.edu.cn/')) {
+  if (!tab || !tab.url || !tab.url.startsWith(LOGIN_URL_PREFIX)) return null;
+  return tab;
+}
+
+$login.addEventListener('click', async () => {
+  const tab = await activeLoginTab();
+  if (!tab) {
+    setStatus('请先在当前标签页打开上财登录页（login.sufe.edu.cn），再点「登录」。', true);
+    return;
+  }
+  setStatus('正在登录…（结果见页面右上角浮窗）');
+  try {
+    await chrome.tabs.sendMessage(tab.id, { type: 'SUFE_RUN_NOW' });
+    setStatus('已通知页面开始登录，请看页面浮窗 ✓');
+  } catch (e) {
+    // 页面还没有注入过脚本（例如刚安装扩展）：直接注入并带上“立即执行”标记
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => { window.__SUFE_RUN_NOW__ = true; },
+      });
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['sufe-crypto.js', 'sufe-cnn-weights.js', 'sufe-cnn.js', 'content.js'],
+      });
+      setStatus('已注入脚本并开始登录，请看页面浮窗 ✓');
+    } catch (e2) {
+      setStatus('注入失败：' + (e2 && e2.message ? e2.message : e2) + '\n请刷新登录页后重试。', true);
+    }
+  }
+});
+
+$test.addEventListener('click', async () => {
+  const tab = await activeLoginTab();
+  if (!tab) {
     setStatus('请先打开上财登录页（login.sufe.edu.cn）标签页，再点击测试。', true);
     return;
   }

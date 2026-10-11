@@ -1,165 +1,201 @@
 /*
- * 上财自动滑块 · 缺口识别 CNN（纯 JS 前向，无依赖）
- * 结构（与 lab/cnn.py 训练时完全一致）：
- *   输入 (2,58,256) = [gray, sat]，取背景图 rows [Y-8, Y+108) 的横带，
- *   宽度统一为 512（>512 左对齐裁剪，<512 reflect 补齐；不缩放以保持缺口物理尺寸），
- *   再 2x2 平均下采样。
- *   → conv3x3 2→10 + relu + maxpool2x2 → conv3x3 10→16 + relu + maxpool(整列取最大)
- *   → conv1x1 16→1 → 128 列 softmax；列 c 对应原图 x = 4c（±2 列质心细化）
- * 权重由 sufe-cnn-weights.js 注入 window.SUFE_CNN_WEIGHTS。
+ * 上财自动滑块 · 缺口定位 CNN（纯 JS 前向，无依赖）
+ *
+ * 输入：整张背景图（不做裁剪），area-resize 到 256x128 后归一 [-1,1]（CHW），
+ * 结构：4×[Conv3x3+ReLU → 高度方向 MaxPool] → 全高 MaxPool → Conv1x1 → 256 列 logits
+ *       → softmax → soft-argmax
+ * 输出：缺口「可通过窗口中心」在原图像素坐标（四舍五入即服务端期望的 X，两侧各 ±2px 余量）。
+ * 权重由 lab/train2.py 训练导出（sufe-cnn-weights.js 注入 window.SUFE_CNN_WEIGHTS）。
+ *
+ * API:
+ *   SufeCNN.locate(px, w, h) -> { x, conf, col }   px 可为 RGBA(canvas) 或 RGB
+ *   SufeCNN.segment(px, w, h) -> { x0,y0,w,h,cnt } | null   经典分割兜底
  */
-var SufeCnn = (function () {
+var SufeCNN = (function () {
   'use strict';
-  var NCOL = 128, STRIDE = 4, PIECE_DX = 2, BAND_TOP = -8, BAND_H = 116;
-  var CANON_W = 512, BW = 256, BH = 58;
-  var W1, B1, W2, B2, W3, B3; // Float32Array
 
-  function dec(b64) {
+  var META = null, LAYERS = null;
+
+  function b64ToF32(b64) {
     var bin = atob(b64);
-    var n = bin.length;
-    var buf = new Uint8Array(n);
-    for (var i = 0; i < n; i++) buf[i] = bin.charCodeAt(i);
-    return new Float32Array(buf.buffer);
+    var u8 = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return new Float32Array(u8.buffer);
   }
 
   function load() {
-    var w = window.SUFE_CNN_WEIGHTS.w;
-    W1 = dec(w['l0.W'].b64); B1 = dec(w['l0.b'].b64);
-    W2 = dec(w['l3.W'].b64); B2 = dec(w['l3.b'].b64);
-    W3 = dec(w['l6.W'].b64); B3 = dec(w['l6.b'].b64);
+    var W = window.SUFE_CNN_WEIGHTS;
+    if (!W) throw new Error('SUFE_CNN_WEIGHTS 未加载');
+    META = W.meta;
+    LAYERS = W.layers.map(function (L) {
+      return { k: L.k, cin: L.cin, cout: L.cout, w: b64ToF32(L.w), b: b64ToF32(L.b) };
+    });
   }
 
-  function refl(i, n) { // reflect 索引（不重复边界）
-    if (i < n) return i;
-    var p = 2 * (n - 1), m = i % p;
-    return m < n ? m : p - m;
+  // 与 numpy resize.py 等价：权重 = 区间重叠长度 / 目标区间长度（分离式，两次加权）
+  function axisWeights(srcN, dstN) {
+    var sr = srcN / dstN;
+    var M = [];
+    for (var i = 0; i < dstN; i++) {
+      var a = i * sr, b = (i + 1) * sr;
+      var j0 = Math.floor(a), j1 = Math.ceil(b), row = [];
+      for (var j = j0; j < j1 && j < srcN; j++) {
+        var ov = Math.min(j + 1, b) - Math.max(j, a);
+        row.push([j, ov > 0 ? ov / (b - a) : 0]);
+      }
+      M.push(row);
+    }
+    return M;
   }
 
-  // px: RGBA Uint8ClampedArray；w,h 原图尺寸；Y 服务端纵坐标 → (2,58,256)
-  function prep(px, w, h, Y) {
-    var out = new Float32Array(2 * BH * BW);
-    var top = Y + BAND_TOP;
-    for (var c = 0; c < 2; c++) {
-      for (var br = 0; br < BH; br++) {
-        var r0 = top + 2 * br;
-        for (var bc = 0; bc < BW; bc++) {
-          var c0 = refl(2 * bc, w), c1 = refl(2 * bc + 1, w);
-          var a = srcAt(px, w, h, r0, c0, c), b = srcAt(px, w, h, r0, c1, c);
-          var d = srcAt(px, w, h, r0 + 1, c0, c), e = srcAt(px, w, h, r0 + 1, c1, c);
-          out[(c * BH + br) * BW + bc] = (a + b + d + e) * 0.25;
+  function toRgb(pix, w, h) {
+    if (pix.length === w * h * 4) {
+      var rgb = new Uint8Array(w * h * 3);
+      for (var i = 0, j = 0; i < pix.length; i += 4, j += 3) {
+        rgb[j] = pix[i]; rgb[j + 1] = pix[i + 1]; rgb[j + 2] = pix[i + 2];
+      }
+      return rgb;
+    }
+    return pix;
+  }
+
+  // RGB uint8 → CHW float32 [-1,1]，尺寸 (dw,dh)
+  function prep(pix, w, h, dw, dh) {
+    var rgb = toRgb(pix, w, h);
+    var Wy = axisWeights(h, dh), Wx = axisWeights(w, dw);
+    // 先沿 y：中间 (dh, w, 3)
+    var mid = new Float32Array(dh * w * 3);
+    for (var dy = 0; dy < dh; dy++) {
+      var row = Wy[dy];
+      for (var x = 0; x < w; x++) {
+        var r = 0, g = 0, b = 0;
+        for (var ki = 0; ki < row.length; ki++) {
+          var j = row[ki][0], wt = row[ki][1];
+          var p = (j * w + x) * 3;
+          r += rgb[p] * wt; g += rgb[p + 1] * wt; b += rgb[p + 2] * wt;
         }
+        var o = (dy * w + x) * 3;
+        mid[o] = r / 255 * 2 - 1; mid[o + 1] = g / 255 * 2 - 1; mid[o + 2] = b / 255 * 2 - 1;
+      }
+    }
+    // 再沿 x：输出 CHW (3, dh, dw)
+    var plane = dh * dw;
+    var out = new Float32Array(plane * 3);
+    for (var dx = 0; dx < dw; dx++) {
+      var col = Wx[dx];
+      for (var y = 0; y < dh; y++) {
+        var r2 = 0, g2 = 0, b2 = 0;
+        for (var kj = 0; kj < col.length; kj++) {
+          var xx = col[kj][0], wt2 = col[kj][1];
+          var q = (y * w + xx) * 3;
+          r2 += mid[q] * wt2; g2 += mid[q + 1] * wt2; b2 += mid[q + 2] * wt2;
+        }
+        var ob = y * dw + dx;
+        out[ob] = r2; out[ob + plane] = g2; out[ob + 2 * plane] = b2;
       }
     }
     return out;
   }
 
-  function srcAt(px, w, h, r, c, ch) {
-    if (r < 0) r = 0; else if (r >= h) r = h - 1;
-    if (c < 0) c = 0; else if (c >= w) c = w - 1;
-    var p = (r * w + c) * 4;
-    var R = px[p], G = px[p + 1], B = px[p + 2];
-    if (ch === 0) return (R + G + B) / 765.0;
-    var mx = R > G ? (R > B ? R : B) : (G > B ? G : B);
-    var mn = R < G ? (R < B ? R : B) : (G < B ? G : B);
-    return (mx - mn) / 255.0;
-  }
-
-  // inp: (cin,hin,win)；3x3 conv(pad=edge)+relu，尺寸不变
-  function convRelu(inp, cin, hin, win, Wt, Bt) {
-    var cout = (Wt.length / (cin * 9)) | 0;
-    var out = new Float32Array(cout * hin * win);
-    for (var oc = 0; oc < cout; oc++) {
-      for (var y = 0; y < hin; y++) {
-        for (var x = 0; x < win; x++) {
-          var s = Bt[oc];
-          for (var ic = 0; ic < cin; ic++) {
-            for (var ky = -1; ky <= 1; ky++) {
-              var yy = y + ky; if (yy < 0) yy = 0; else if (yy >= hin) yy = hin - 1;
-              for (var kx = -1; kx <= 1; kx++) {
-                var xx = x + kx; if (xx < 0) xx = 0; else if (xx >= win) xx = win - 1;
-                s += inp[(ic * hin + yy) * win + xx] * Wt[(oc * cin + ic) * 9 + (ky + 1) * 3 + (kx + 1)];
+  // 3x3 conv + ReLU（**零填充**，与 torch Conv2d(padding=1) 及训练端一致），尺寸不变
+  function conv3Relu(x, ci, h, w, L, out) {
+    var co = L.cout, kw = L.w, kb = L.b;
+    for (var o = 0; o < co; o++) {
+      var ob = o * h * w;
+      for (var y = 0; y < h; y++) {
+        for (var xx = 0; xx < w; xx++) {
+          var acc = kb[o];
+          for (var c = 0; c < ci; c++) {
+            var kc = (o * ci + c) * 9, ch = c * h * w;
+            for (var dy = -1; dy <= 1; dy++) {
+              var yy = y + dy; if (yy < 0 || yy >= h) continue;
+              for (var dx = -1; dx <= 1; dx++) {
+                var xa = xx + dx; if (xa < 0 || xa >= w) continue;
+                acc += kw[kc + (dy + 1) * 3 + (dx + 1)] * x[ch + yy * w + xa];
               }
             }
           }
-          out[(oc * hin + y) * win + x] = s > 0 ? s : 0;
+          out[ob + y * w + xx] = acc > 0 ? acc : 0;
         }
       }
     }
-    return out;
   }
 
-  function maxpool2(inp, c, h, w) {
-    var oh = h >> 1, ow = w >> 1;
-    var out = new Float32Array(c * oh * ow);
-    for (var cc = 0; cc < c; cc++) {
+  function maxPoolY2(x, c, h, w, out) {
+    var oh = h >> 1;
+    for (var i = 0; i < c; i++) {
       for (var y = 0; y < oh; y++) {
-        for (var x = 0; x < ow; x++) {
-          var i0 = (cc * h + 2 * y) * w + 2 * x;
-          var a = inp[i0], b = inp[i0 + 1], d = inp[i0 + w], e = inp[i0 + w + 1];
-          var m = a > b ? a : b, m2 = d > e ? d : e;
-          out[(cc * oh + y) * ow + x] = m > m2 ? m : m2;
+        var a0 = (i * h + 2 * y) * w, b0 = (i * h + 2 * y + 1) * w, o0 = (i * oh + y) * w;
+        for (var xx = 0; xx < w; xx++) {
+          out[o0 + xx] = x[a0 + xx] > x[b0 + xx] ? x[a0 + xx] : x[b0 + xx];
         }
       }
     }
-    return out;
+    return oh;
   }
 
-  function maxpoolRows(inp, c, h, w) {
-    var out = new Float32Array(c * w);
-    for (var cc = 0; cc < c; cc++) {
-      for (var x = 0; x < w; x++) {
-        var m = -Infinity;
-        for (var y = 0; y < h; y++) { var v = inp[(cc * h + y) * w + x]; if (v > m) m = v; }
-        out[cc * w + x] = m;
+  function locate(px, w, h) {
+    if (!LAYERS) load();
+    var IN_W = META.in_w, IN_H = META.in_h;
+    var cur = prep(px, w, h, IN_W, IN_H), ci = 3, hh = IN_H, ww = IN_W;
+    for (var l = 0; l < LAYERS.length; l++) {
+      var L = LAYERS[l];
+      if (L.k === 3) {
+        var buf = new Float32Array(L.cout * hh * ww);
+        conv3Relu(cur, ci, hh, ww, L, buf);
+        var pooled = new Float32Array(L.cout * (hh >> 1) * ww);
+        hh = maxPoolY2(buf, L.cout, hh, ww, pooled);
+        cur = pooled; ci = L.cout;
+      } else {
+        break;
       }
     }
-    return out;
-  }
-
-  // px: RGBA Uint8ClampedArray；w=像素缓冲宽度（行距），h 缓冲高；Y 服务端纵坐标；
-  // origW=背景图原始宽度（默认取 w），仅用于屏蔽不可能的缺口列。
-  function predict(px, w, h, Y, origW) {
-    if (!W1) load();
-    var x0 = prep(px, w, h, Y);                    // (2,58,256)
-    var a1 = convRelu(x0, 2, BH, BW, W1, B1);      // (10,58,256)
-    var p1 = maxpool2(a1, 10, BH, BW);             // (10,29,128)
-    var a2 = convRelu(p1, 10, 29, NCOL, W2, B2);   // (16,29,128)
-    var p2 = maxpoolRows(a2, 16, 29, NCOL);        // (16,1,128)
-    var logits = new Float32Array(NCOL);
-    // 缺口左缘 nx ∈ [0, origW-96]；列 c 对应 nx≈4c → 屏蔽不可能列（含 reflect 补齐区）
-    var maxCol = Math.floor(((origW || w) - 92) / STRIDE);
-    for (var x = 0; x < NCOL; x++) {
-      var s = B3[0];
-      for (var ic = 0; ic < 16; ic++) s += p2[ic * NCOL + x] * W3[ic];
-      logits[x] = (x <= maxCol) ? s : -1e9;
+    // 全高 max（等价 numpy 的 MaxPoolRows）
+    var feat = new Float32Array(ci * ww);
+    for (var c = 0; c < ci; c++) {
+      for (var x = 0; x < ww; x++) {
+        var m = -Infinity;
+        for (var y = 0; y < hh; y++) { var v = cur[(c * hh + y) * ww + x]; if (v > m) m = v; }
+        feat[c * ww + x] = m;
+      }
     }
+    // 1x1 conv（最后一层）→ 每列 logits
+    var head = LAYERS[LAYERS.length - 1];
+    var logits = new Float32Array(ww);
+    for (var x2 = 0; x2 < ww; x2++) {
+      var s = head.b[0];
+      for (var c2 = 0; c2 < ci; c2++) s += head.w[c2] * feat[c2 * ww + x2];
+      logits[x2] = s;
+    }
+    // softmax + soft-argmax（±2 列质心细化）
     var mx = -Infinity;
-    for (x = 0; x < NCOL; x++) if (logits[x] > mx) mx = logits[x];
-    var sum = 0, probs = new Float32Array(NCOL);
-    for (x = 0; x < NCOL; x++) { probs[x] = Math.exp(logits[x] - mx); sum += probs[x]; }
-    var c = 0, bp = 0;
-    for (x = 0; x < NCOL; x++) { probs[x] /= sum; if (probs[x] > bp) { bp = probs[x]; c = x; } }
-    var lo = Math.max(0, c - 2), hi = Math.min(NCOL, c + 3), ws = 0, acc = 0;
-    for (x = lo; x < hi; x++) { ws += probs[x]; acc += x * probs[x]; }
-    var xpix = (acc / ws) * STRIDE;
-    return { x: xpix, X: Math.round(xpix) - PIECE_DX, col: c, conf: bp };
+    for (var i3 = 0; i3 < ww; i3++) if (logits[i3] > mx) mx = logits[i3];
+    var sum = 0, probs = new Float32Array(ww);
+    for (var i4 = 0; i4 < ww; i4++) { probs[i4] = Math.exp(logits[i4] - mx); sum += probs[i4]; }
+    var best = 0, bestI = 0;
+    for (var i5 = 0; i5 < ww; i5++) { probs[i5] /= sum; if (probs[i5] > best) { best = probs[i5]; bestI = i5; } }
+    var lo = Math.max(0, bestI - 2), hi = Math.min(ww, bestI + 3), ws = 0, acc = 0;
+    for (var i6 = lo; i6 < hi; i6++) { ws += probs[i6]; acc += i6 * probs[i6]; }
+    var xIn = acc / ws;
+    return { x: xIn * (w / IN_W), conf: best, col: bestI };
   }
 
   // 兜底：经典分割（平坦高亮低饱和连通块 = 缺口）→ {x0,y0,w,h,cnt} 或 null
   function segment(px, w, h) {
     var n = w * h;
     var flat = new Uint8Array(n);
+    var rgb = toRgb(px, w, h);
     for (var y = 1; y < h - 1; y++) {
       for (var x = 1; x < w - 1; x++) {
-        var i = y * w + x, p = i * 4;
-        var R = px[p], G = px[p + 1], B = px[p + 2];
+        var i = y * w + x, p = i * 3;
+        var R = rgb[p], G = rgb[p + 1], B = rgb[p + 2];
         var mx = R > G ? (R > B ? R : B) : (G > B ? G : B);
         var mn = R < G ? (R < B ? R : B) : (G < B ? G : B);
         if ((R + G + B) / 3 <= 200 || (mx - mn) >= 16) continue;
         var s = 0, s2 = 0;
         for (var dy = -1; dy <= 1; dy++) for (var dx = -1; dx <= 1; dx++) {
-          var q = ((y + dy) * w + (x + dx)) * 4;
-          var gv = (px[q] + px[q + 1] + px[q + 2]) / 3;
+          var q = ((y + dy) * w + (x + dx)) * 3;
+          var gv = (rgb[q] + rgb[q + 1] + rgb[q + 2]) / 3;
           s += gv; s2 += gv * gv;
         }
         var mean = s / 9;
@@ -194,5 +230,12 @@ var SufeCnn = (function () {
     return best;
   }
 
-  return { predict: predict, segment: segment, NCOL: NCOL, STRIDE: STRIDE };
+  // 分割结果的窗口中心（与训练标签一致：nx - 3）
+  function segmentX(px, w, h) {
+    var s = segment(px, w, h);
+    return s ? s.x0 - 3 : null;
+  }
+
+  return { locate: locate, segment: segment, segmentX: segmentX, load: load };
 })();
+if (typeof module !== 'undefined') module.exports = SufeCNN;

@@ -1,8 +1,12 @@
 /*
  * 上财自动滑块 · 内容脚本
- * 检测到上财统一认证登录页后：倒计时 → 自动「缺口识别 + 滑块校验 + 登录」→ 跳转。
- * 缺口识别技术路线：轻量全卷积 CNN（conv + 池化）对背景图做列分类定位缺口，
- *   经典「平坦高亮连通块」分割作兜底，二者一致时一次通过；最后才退回盲试候选。
+ * 检测到上财统一认证登录页后：倒计时 → 自动「CNN 缺口定位 + 登录」→ 跳转。
+ *
+ * 滑块策略（整图 CNN + 邻域梯队）：
+ *   背景图整图 → sufe-cnn.js（纯 JS 前向）预测「可通过窗口中心」X；先试 0/±1/±2，
+ *   再用经典分割兜底（缺口=平坦纯白连通块）与分割邻域，最后才是历史盲试候选。
+ *   服务端容差实测：可通过窗口恒为 5 个连续整数（中心 = 缺口左缘-3），故 0/±1/±2 已覆盖全部余量。
+ *   失败不会作废 token，同一 token 内可连续校验。
  * 仅向 login.sufe.edu.cn 提交数据，密码 RSA(PKCS#1 v1.5) 加密后传输。
  */
 (async function () {
@@ -10,18 +14,19 @@
   if (window.__SUFE_AUTO_SLIDER__) return;
   window.__SUFE_AUTO_SLIDER__ = true;
 
-  // ── 常量（与生产脚本一致，一般无需修改） ────────────────────────────
+  // ── 常量（一般无需修改） ────────────────────────────────────────────
   const BASE = 'https://login.sufe.edu.cn/esc-sso';
-  const X_CANDIDATES = [100, 98, 102];  // 仅在缺口识别完全失败时兜底
-  const MAX_ROUNDS = 12;
+  const MAX_ROUNDS = 6;
   const AUTO_DELAY_MS = 4000;      // 检测到登录页后的倒计时，给用户留取消窗口
   const LOOP_GUARD_MS = 20000;     // 自动登录成功后 20s 内不再自动启动（防死循环）
   const CFG_KEY = 'sufeAutoSliderCfg';
   const STATE_KEY = 'sufeAutoSliderState';
+  const STATS_KEY = 'sufeAutoSliderStats';
+  const BLIND_X = [100, 98, 102];  // 仅在识别完全失败时兜底
 
   // ── 小工具 ──────────────────────────────────────────────────────────
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  function backoff(rnd) { return rnd >= 8 ? 8000 : rnd >= 5 ? 4000 : 1500; }
+  function backoff(rnd) { return rnd >= 4 ? 3000 : 1200; }
 
   async function getCfg() {
     const o = await chrome.storage.local.get(CFG_KEY);
@@ -30,6 +35,16 @@
   async function getState() {
     const o = await chrome.storage.local.get(STATE_KEY);
     return o[STATE_KEY] || {};
+  }
+  async function recordStat(firstTry, X, conf) {
+    try {
+      const o = await chrome.storage.local.get(STATS_KEY);
+      const s = o[STATS_KEY] || { n: 0, firstTry: 0 };
+      s.n++; if (firstTry) s.firstTry++;
+      s.lastX = X;
+      s.lastConf = (conf == null) ? null : Math.round(conf * 1000) / 1000;
+      await chrome.storage.local.set({ [STATS_KEY]: s });
+    } catch (e) { /* 统计失败不影响流程 */ }
   }
 
   async function api(path, opts = {}) {
@@ -48,7 +63,7 @@
     }
   }
 
-  // ── 缺口识别：CNN 主判 + 经典分割兜底 ───────────────────────────────
+  // ── 缺口定位：整图 CNN 主判 + 经典分割兜底 ──────────────────────────
   async function decodeSource(b64) {
     const bin = atob(b64);
     const arr = new Uint8Array(bin.length);
@@ -66,27 +81,27 @@
   async function detectGap(d) {
     const img = await decodeSource(d.sourceImage);
     let cnn = null, segX = null;
-    try { cnn = SufeCnn.predict(img.px, img.w, img.h, d.Y); } catch (e) { cnn = null; }
-    try { const s = SufeCnn.segment(img.px, img.w, img.h); if (s) segX = s.x0 - 2; } catch (e) { /* 忽略 */ }
+    try { cnn = SufeCNN.locate(img.px, img.w, img.h); } catch (e) { cnn = null; }
+    try { segX = SufeCNN.segmentX(img.px, img.w, img.h); } catch (e) { /* 忽略 */ }
     return { cnn: cnn, segX: segX };
   }
 
-  // 候选梯队：CNN → 分割 → CNN 邻域 → 分割邻域 →（识别全失败时）盲试
+  // 候选梯队：CNN → CNN 邻域 → 分割 → 分割邻域 → 盲试
   function candidateLadder(det) {
     const out = [];
     const push = (x, m) => {
       if (x == null || !isFinite(x)) return;
       x = Math.round(x);
-      if (x < 0 || x > 500) return;
+      if (x < 0 || x > 600) return;
       if (!out.some((o) => o.x === x)) out.push({ x: x, m: m });
     };
-    const cx = det.cnn ? det.cnn.X : null;
+    const cx = det.cnn ? det.cnn.x : null;
     push(cx, 'cnn');
-    push(det.segX, 'seg');
     push(cx + 1, 'cnn+1'); push(cx - 1, 'cnn-1');
     push(cx + 2, 'cnn+2'); push(cx - 2, 'cnn-2');
+    push(det.segX, 'seg');
     if (det.segX != null) { push(det.segX + 1, 'seg+1'); push(det.segX - 1, 'seg-1'); }
-    if (!out.length) for (const b of X_CANDIDATES) push(b, 'blind');
+    if (!out.length) for (const b of BLIND_X) push(b, 'blind');
     return out;
   }
 
@@ -107,16 +122,18 @@
         '&Y=' + encodeURIComponent(y) + '&token=' + encodeURIComponent(token)
       );
       if (String(r.code) === '0') {
+        const first = ladder.length > 0 && c === ladder[0];
+        await recordStat(first, c.x, det.cnn ? det.cnn.conf : null);
         return {
-          vcode: r.data, x: c.x, y: y, method: c.m,
-          cnnX: det.cnn ? det.cnn.X : null, conf: det.cnn ? det.cnn.conf : 0, segX: det.segX,
+          vcode: r.data, x: c.x, y: y, method: c.m, firstTry: first,
+          cnnX: det.cnn ? Math.round(det.cnn.x) : null, conf: det.cnn ? det.cnn.conf : 0, segX: det.segX,
         };
       }
       lastMsg = r.msg || lastMsg;
     }
     return {
       vcode: null, lastMsg: lastMsg, method: 'none',
-      cnnX: det.cnn ? det.cnn.X : null, conf: det.cnn ? det.cnn.conf : 0, segX: det.segX,
+      cnnX: det.cnn ? Math.round(det.cnn.x) : null, conf: det.cnn ? det.cnn.conf : 0, segX: det.segX,
     };
   }
 
@@ -129,12 +146,12 @@
           return {
             ok: true,
             detail: '第 ' + rnd + ' 轮通过（X=' + v.x + ' Y=' + v.y + ' 方式=' + v.method +
-              (v.cnnX != null ? ' CNN=' + Math.round(v.cnnX) + '/conf' + v.conf.toFixed(2) : '') +
+              (v.cnnX != null ? ' CNN=' + v.cnnX + '/conf' + v.conf.toFixed(2) : '') +
               (v.segX != null ? ' 分割=' + v.segX : '') + '）',
           };
         }
         log.push('第 ' + rnd + ' 轮未通过（' + (v.lastMsg || '无信息') +
-          (v.cnnX != null ? ' CNN=' + Math.round(v.cnnX) : '') +
+          (v.cnnX != null ? ' CNN=' + v.cnnX : '') +
           (v.segX != null ? ' 分割=' + v.segX : '') + '）');
       } catch (e) { log.push('第 ' + rnd + ' 轮异常：' + e.message); }
       if (rnd < rounds) await sleep(backoff(rnd));
@@ -173,11 +190,11 @@
       checkStop();
       ui.status('滑块解锁中（第 ' + rnd + '/' + MAX_ROUNDS + ' 轮）…');
       let v;
-      try { v = await sliderRound(); }
+      try { v = await sliderRound(ui); }
       catch (e) { ui.note('init 异常：' + e.message); await sleep(backoff(rnd)); continue; }
       if (!v.vcode) {
         ui.note('第 ' + rnd + ' 轮未通过（' + (v.lastMsg || '无信息') +
-          (v.cnnX != null ? ' CNN=' + Math.round(v.cnnX) : '') +
+          (v.cnnX != null ? ' CNN=' + v.cnnX : '') +
           (v.segX != null ? ' 分割=' + v.segX : '') + '）');
         if (rnd < MAX_ROUNDS) await sleep(backoff(rnd));
         continue;
@@ -203,8 +220,10 @@
         await chrome.storage.local.set({ [STATE_KEY]: { lastAutoLoginAt: Date.now() } });
         return res;
       }
-      if (res.code === 'SSO10002') {
-        const err = new Error('学号或密码错误（SSO10002），请在扩展设置中更正');
+      if (res.code === 'SSO10002' || res.code === 'SSO10001') {
+        const err = new Error(res.code === 'SSO10001'
+          ? '学号不存在（SSO10001），请在扩展设置中更正'
+          : '学号或密码错误（SSO10002），请在扩展设置中更正');
         err.stopRetry = true;
         throw err;
       }
@@ -355,7 +374,9 @@
     ]);
   }
 
-  // 用户开始在页面表单里输入 → 取消倒计时，转为手动卡片
+  // 用户开始在页面表单里输入 → 取消倒计时，转为手动卡片。
+  // 只认 pointerdown/input：关闭浏览器翻译弹窗等场景只会令输入框重新获得焦点（focusin），
+  // 若无 pointerdown 也取消，会被误判为手动操作。
   function onUserInteract(e) {
     if (state !== 'pending') return;
     if (!(e.target instanceof Element)) return;
@@ -378,10 +399,19 @@
     return null;
   }
 
-  // ── 消息：来自 popup 的「测试滑块」 ─────────────────────────────────
+  // ── 消息：来自 popup 的「测试滑块」「立即登录」 ─────────────────────
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg && msg.type === 'SUFE_TEST_SLIDER') {
       testSlider(3).then(sendResponse);
+      return true;
+    }
+    if (msg && msg.type === 'SUFE_RUN_NOW') {
+      startFlow();
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (msg && msg.type === 'SUFE_STATS') {
+      chrome.storage.local.get(STATS_KEY).then((o) => sendResponse(o[STATS_KEY] || null));
       return true;
     }
   });
@@ -391,6 +421,13 @@
   const form = await waitForForm(20000);
   if (!form) return; // 不是登录页（或页面已跳转/渲染失败），静默退出
 
+  // popup「登录」免刷新注入路径携带此标记：跳过倒计时与各项拦截，立即开始
+  if (window.__SUFE_RUN_NOW__) {
+    delete window.__SUFE_RUN_NOW__;
+    startFlow();
+    return;
+  }
+
   // 闭环自检触发：访问 login.sufe.edu.cn/login/#sufe-test-slider
   // 只跑滑块验证（不提交账号密码），结果显示在浮窗中。
   if (location.hash.indexOf('sufe-test-slider') >= 0) {
@@ -399,7 +436,7 @@
     return;
   }
 
-  document.addEventListener('focusin', onUserInteract, true);
+  document.addEventListener('pointerdown', onUserInteract, true);
   document.addEventListener('input', onUserInteract, true);
 
   const st = await getState();
