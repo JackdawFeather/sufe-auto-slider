@@ -11,7 +11,8 @@ import urllib.request
 from urllib.error import HTTPError
 
 OWNER, REPO = "haohaoo3o", "sufe-auto-slider"
-PROXY = os.environ.get("SUFE_PROXY", "http://127.0.0.1:7890")
+# 默认直连；需要时用 SUFE_PROXY=http://127.0.0.1:7890 指定代理
+PROXY = os.environ.get("SUFE_PROXY", "").strip()
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIST = os.environ.get("SUFE_DIST") or next(
     (p for p in (os.path.join(os.path.dirname(ROOT), "dist"), os.path.join(ROOT, "dist"))
@@ -69,7 +70,8 @@ def api(method, url, data=None, token_=None, ctype="application/json"):
     req.add_header("User-Agent", "sufe-release-script")
     if data is not None:
         req.add_header("Content-Type", ctype)
-    op = urllib.request.build_opener(urllib.request.ProxyHandler({"https": PROXY, "http": PROXY}))
+    op = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"https": PROXY, "http": PROXY}) if PROXY else urllib.request.ProxyHandler({}))
     with op.open(req, timeout=120) as r:
         return json.loads(r.read().decode() or "{}")
 
