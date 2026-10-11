@@ -77,11 +77,12 @@ def api(method, url, data=None, token_=None, ctype="application/json"):
 
 
 def main():
-    ver = sys.argv[1] if sys.argv[1:] else "2.0.0"
+    ver = sys.argv[1] if sys.argv[1:] else "4.0.0"
     tag = "v" + ver
+    title = os.environ.get("SUFE_RELEASE_TITLE", "上财自动滑块").strip()
     tk = token()
     rel = api("POST", f"https://api.github.com/repos/{OWNER}/{REPO}/releases", json.dumps({
-        "tag_name": tag, "name": f"{tag} · CNN 缺口识别", "body": BODY,
+        "tag_name": tag, "name": f"{tag} · {title}", "body": BODY,
         "draft": False, "prerelease": False,
     }).encode(), tk)
     print("release:", rel.get("html_url") or rel)
