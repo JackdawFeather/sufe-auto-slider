@@ -1,8 +1,8 @@
 /*
  * 上财自动滑块 · 内容脚本
- * 检测到上财统一认证登录页后：倒计时 → 自动「滑块盲试 + 登录」→ 跳转。
- * 策略沿用生产环境长期验证的「候选 X 盲试 + 多轮重试 + 失败退避」：
- *   候选 X = 100/98/102，每个 token 最多试 3 个，最多 12 轮，退避 1.5s/4s/8s。
+ * 检测到上财统一认证登录页后：倒计时 → 自动「缺口识别 + 滑块校验 + 登录」→ 跳转。
+ * 缺口识别技术路线：轻量全卷积 CNN（conv + 池化）对背景图做列分类定位缺口，
+ *   经典「平坦高亮连通块」分割作兜底，二者一致时一次通过；最后才退回盲试候选。
  * 仅向 login.sufe.edu.cn 提交数据，密码 RSA(PKCS#1 v1.5) 加密后传输。
  */
 (async function () {
@@ -12,8 +12,7 @@
 
   // ── 常量（与生产脚本一致，一般无需修改） ────────────────────────────
   const BASE = 'https://login.sufe.edu.cn/esc-sso';
-  const X_CANDIDATES = [100, 98, 102];
-  const MAX_X_PER_ROUND = 3;
+  const X_CANDIDATES = [100, 98, 102];  // 仅在缺口识别完全失败时兜底
   const MAX_ROUNDS = 12;
   const AUTO_DELAY_MS = 4000;      // 检测到登录页后的倒计时，给用户留取消窗口
   const LOOP_GUARD_MS = 20000;     // 自动登录成功后 20s 内不再自动启动（防死循环）
@@ -49,22 +48,76 @@
     }
   }
 
-  // ── 滑块与登录核心（移植自生产脚本） ────────────────────────────────
-  async function sliderRound() {
+  // ── 缺口识别：CNN 主判 + 经典分割兜底 ───────────────────────────────
+  async function decodeSource(b64) {
+    const bin = atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    const bmp = await createImageBitmap(new Blob([arr], { type: 'image/png' }));
+    const cv = document.createElement('canvas');
+    cv.width = bmp.width; cv.height = bmp.height;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bmp, 0, 0);
+    const id = ctx.getImageData(0, 0, cv.width, cv.height);
+    if (bmp.close) bmp.close();
+    return { px: id.data, w: cv.width, h: cv.height };
+  }
+
+  async function detectGap(d) {
+    const img = await decodeSource(d.sourceImage);
+    let cnn = null, segX = null;
+    try { cnn = SufeCnn.predict(img.px, img.w, img.h, d.Y); } catch (e) { cnn = null; }
+    try { const s = SufeCnn.segment(img.px, img.w, img.h); if (s) segX = s.x0 - 2; } catch (e) { /* 忽略 */ }
+    return { cnn: cnn, segX: segX };
+  }
+
+  // 候选梯队：CNN → 分割 → CNN 邻域 → 分割邻域 →（识别全失败时）盲试
+  function candidateLadder(det) {
+    const out = [];
+    const push = (x, m) => {
+      if (x == null || !isFinite(x)) return;
+      x = Math.round(x);
+      if (x < 0 || x > 500) return;
+      if (!out.some((o) => o.x === x)) out.push({ x: x, m: m });
+    };
+    const cx = det.cnn ? det.cnn.X : null;
+    push(cx, 'cnn');
+    push(det.segX, 'seg');
+    push(cx + 1, 'cnn+1'); push(cx - 1, 'cnn-1');
+    push(cx + 2, 'cnn+2'); push(cx - 2, 'cnn-2');
+    if (det.segX != null) { push(det.segX + 1, 'seg+1'); push(det.segX - 1, 'seg-1'); }
+    if (!out.length) for (const b of X_CANDIDATES) push(b, 'blind');
+    return out;
+  }
+
+  // ── 滑块与登录核心 ──────────────────────────────────────────────────
+  async function sliderRound(ui) {
     const init = await api('/api/v3/sliderCaptcha/init', { method: 'POST', body: {} });
     const d = init && init.data;
     if (!d || !d.token) throw new Error('滑块 init 失败：' + ((init && init.msg) || '未知错误'));
     const y = d.Y, token = d.token;
+    let det = { cnn: null, segX: null };
+    try { det = await detectGap(d); }
+    catch (e) { if (ui) ui.note('背景图解码失败，退回盲试：' + e.message); }
+    const ladder = candidateLadder(det);
     let lastMsg = (init && init.msg) || '';
-    for (const x of X_CANDIDATES.slice(0, MAX_X_PER_ROUND)) {
+    for (const c of ladder) {
       const r = await api(
-        '/api/v3/sliderCaptcha/check?X=' + encodeURIComponent(x) +
+        '/api/v3/sliderCaptcha/check?X=' + encodeURIComponent(c.x) +
         '&Y=' + encodeURIComponent(y) + '&token=' + encodeURIComponent(token)
       );
-      if (String(r.code) === '0') return { vcode: r.data, x: x, y: y };
+      if (String(r.code) === '0') {
+        return {
+          vcode: r.data, x: c.x, y: y, method: c.m,
+          cnnX: det.cnn ? det.cnn.X : null, conf: det.cnn ? det.cnn.conf : 0, segX: det.segX,
+        };
+      }
       lastMsg = r.msg || lastMsg;
     }
-    return { vcode: null, lastMsg: lastMsg };
+    return {
+      vcode: null, lastMsg: lastMsg, method: 'none',
+      cnnX: det.cnn ? det.cnn.X : null, conf: det.cnn ? det.cnn.conf : 0, segX: det.segX,
+    };
   }
 
   async function testSlider(rounds) {
@@ -72,8 +125,17 @@
     for (let rnd = 1; rnd <= rounds; rnd++) {
       try {
         const v = await sliderRound();
-        if (v.vcode) return { ok: true, detail: '第 ' + rnd + ' 轮通过（X=' + v.x + ' Y=' + v.y + '）' };
-        log.push('第 ' + rnd + ' 轮未通过（' + (v.lastMsg || '无信息') + '）');
+        if (v.vcode) {
+          return {
+            ok: true,
+            detail: '第 ' + rnd + ' 轮通过（X=' + v.x + ' Y=' + v.y + ' 方式=' + v.method +
+              (v.cnnX != null ? ' CNN=' + Math.round(v.cnnX) + '/conf' + v.conf.toFixed(2) : '') +
+              (v.segX != null ? ' 分割=' + v.segX : '') + '）',
+          };
+        }
+        log.push('第 ' + rnd + ' 轮未通过（' + (v.lastMsg || '无信息') +
+          (v.cnnX != null ? ' CNN=' + Math.round(v.cnnX) : '') +
+          (v.segX != null ? ' 分割=' + v.segX : '') + '）');
       } catch (e) { log.push('第 ' + rnd + ' 轮异常：' + e.message); }
       if (rnd < rounds) await sleep(backoff(rnd));
     }
@@ -114,12 +176,14 @@
       try { v = await sliderRound(); }
       catch (e) { ui.note('init 异常：' + e.message); await sleep(backoff(rnd)); continue; }
       if (!v.vcode) {
-        ui.note('第 ' + rnd + ' 轮未通过（' + (v.lastMsg || '无信息') + '）');
+        ui.note('第 ' + rnd + ' 轮未通过（' + (v.lastMsg || '无信息') +
+          (v.cnnX != null ? ' CNN=' + Math.round(v.cnnX) : '') +
+          (v.segX != null ? ' 分割=' + v.segX : '') + '）');
         if (rnd < MAX_ROUNDS) await sleep(backoff(rnd));
         continue;
       }
       checkStop();
-      ui.status('滑块已解锁（X=' + v.x + '），正在登录…');
+      ui.status('滑块已解锁（X=' + v.x + ' 方式=' + v.method + '），正在登录…');
       const res = await api('/api/v3/auth/doLogin', {
         method: 'POST',
         body: {
@@ -326,6 +390,14 @@
   const cfg = await getCfg();
   const form = await waitForForm(20000);
   if (!form) return; // 不是登录页（或页面已跳转/渲染失败），静默退出
+
+  // 闭环自检触发：访问 login.sufe.edu.cn/login/#sufe-test-slider
+  // 只跑滑块验证（不提交账号密码），结果显示在浮窗中。
+  if (location.hash.indexOf('sufe-test-slider') >= 0) {
+    const r = await testSlider(3);
+    renderCard(r.ok ? '✓ ' + r.detail : '✗ ' + r.detail, [mkBtn('关闭', hideWidget)]);
+    return;
+  }
 
   document.addEventListener('focusin', onUserInteract, true);
   document.addEventListener('input', onUserInteract, true);

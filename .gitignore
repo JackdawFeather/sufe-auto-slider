@@ -4,3 +4,15 @@ desktop.ini
 *.zip
 *.crx
 *.pem
+
+# lab 训练管线：忽略大数据与临时产物（代码进仓库）
+lab/data/dataset.npz
+lab/data/parity_*.raw
+lab/data/cnn_weights.npz
+lab/__pycache__/
+lab/*.log
+lab/bundle.js
+lab/login.html
+
+# 构建产物（dist 与签名密钥不进仓库）
+dist/
