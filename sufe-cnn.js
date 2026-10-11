@@ -180,8 +180,8 @@ var SufeCNN = (function () {
     return { x: xIn * (w / IN_W), conf: best, col: bestI };
   }
 
-  // 兜底：经典分割（平坦高亮低饱和连通块 = 缺口）→ {x0,y0,w,h,cnt} 或 null
-  function segment(px, w, h) {
+  // 经典分割（宽松过滤）：枚举所有「平坦高亮低饱和」连通块 → [{x0,y0,w,h,cnt}]
+  function segmentAll(px, w, h) {
     var n = w * h;
     var flat = new Uint8Array(n);
     var rgb = toRgb(px, w, h);
@@ -202,7 +202,7 @@ var SufeCNN = (function () {
         if (s2 / 9 - mean * mean < 6) flat[i] = 1;
       }
     }
-    var lab = new Int32Array(n), nl = 0, best = null;
+    var lab = new Int32Array(n), nl = 0, cands = [];
     var stack = new Int32Array(n);
     for (var i0 = 0; i0 < n; i0++) {
       if (!flat[i0] || lab[i0]) continue;
@@ -224,8 +224,18 @@ var SufeCNN = (function () {
       }
       var bw = x1 - x0 + 1, bh = y1 - y0 + 1, fill = cnt / (bw * bh);
       if (cnt >= 2000 && bw >= 70 && bw <= 110 && bh >= 70 && bh <= 110 && fill > 0.5 && fill < 0.9) {
-        if (!best || cnt > best.cnt) best = { x0: x0, y0: y0, w: bw, h: bh, cnt: cnt };
+        cands.push({ x0: x0, y0: y0, w: bw, h: bh, cnt: cnt });
       }
+    }
+    return cands;
+  }
+
+  // 经典分割（宽松）：返回面积最大的候选，兼容旧接口
+  function segment(px, w, h) {
+    var cands = segmentAll(px, w, h);
+    var best = null;
+    for (var i = 0; i < cands.length; i++) {
+      if (!best || cands[i].cnt > best.cnt) best = cands[i];
     }
     return best;
   }
@@ -236,6 +246,21 @@ var SufeCNN = (function () {
     return s ? s.x0 - 3 : null;
   }
 
-  return { locate: locate, segment: segment, segmentX: segmentX, load: load };
+  // 严格分割：缺口模板在图中恆为 ~96x93、面积 ~5590（382 张实测 99% 一致）。
+  // 只有「形状/面积合规且全场唯一」才认为可信；多候选或异常 → null（交给 CNN 兜底）。
+  function segmentStrict(px, w, h) {
+    var cands = segmentAll(px, w, h);
+    var tight = [];
+    for (var i = 0; i < cands.length; i++) {
+      var c = cands[i];
+      if (c.w >= 92 && c.w <= 100 && c.h >= 89 && c.h <= 97 &&
+          c.cnt >= 5450 && c.cnt <= 5750) tight.push(c);
+    }
+    if (tight.length === 1) return { x: tight[0].x0 - 3, conf: 1, n: 1 };
+    return null;
+  }
+
+  return { locate: locate, segment: segment, segmentX: segmentX,
+           segmentStrict: segmentStrict, segmentAll: segmentAll, load: load };
 })();
 if (typeof module !== 'undefined') module.exports = SufeCNN;

@@ -63,7 +63,7 @@
     }
   }
 
-  // ── 缺口定位：整图 CNN 主判 + 经典分割兜底 ──────────────────────────
+  // ── 缺口定位：经典分割严格优先（~3ms，缺口模板尺寸/面积恒定），CNN 仅作兜底 ──
   async function decodeSource(b64) {
     const bin = atob(b64);
     const arr = new Uint8Array(bin.length);
@@ -78,31 +78,69 @@
     return { px: id.data, w: cv.width, h: cv.height };
   }
 
-  async function detectGap(d) {
-    const img = await decodeSource(d.sourceImage);
-    let cnn = null, segX = null;
-    try { cnn = SufeCNN.locate(img.px, img.w, img.h); } catch (e) { cnn = null; }
-    try { segX = SufeCNN.segmentX(img.px, img.w, img.h); } catch (e) { /* 忽略 */ }
-    return { cnn: cnn, segX: segX };
+  // 候选偏移梯队：x, x+1, x-1, x+2, x-2
+  // （可通过窗口恒为 5 个连续整数、半径 ±2，±2 已覆盖全部余量）
+  function offsets(x, m) {
+    if (x == null || !isFinite(x)) return [];
+    const x0 = Math.round(x);
+    if (x0 < 0 || x0 > 600) return [];
+    const out = [];
+    const push = (v, mm) => {
+      if (v >= 0 && v <= 600 && !out.some((o) => o.x === v)) out.push({ x: v, m: mm });
+    };
+    push(x0, m);
+    push(x0 + 1, m + '+1'); push(x0 - 1, m + '-1');
+    push(x0 + 2, m + '+2'); push(x0 - 2, m + '-2');
+    return out;
   }
 
-  // 候选梯队：CNN → CNN 邻域 → 分割 → 分割邻域 → 盲试
-  function candidateLadder(det) {
-    const out = [];
-    const push = (x, m) => {
-      if (x == null || !isFinite(x)) return;
-      x = Math.round(x);
-      if (x < 0 || x > 600) return;
-      if (!out.some((o) => o.x === x)) out.push({ x: x, m: m });
+  async function decodeAndSegment(d) {
+    const img = await decodeSource(d.sourceImage);
+    let strict = null;
+    try { strict = SufeCNN.segmentStrict(img.px, img.w, img.h); } catch (e) { strict = null; }
+    return { img: img, strict: strict, cnn: null, looseX: null };
+  }
+
+  // 懒执行 CNN（较慢 ~1-2s，只在需要时跑一次）
+  function runCnn(det) {
+    if (!det || !det.img || det.cnn) return det ? det.cnn : null;
+    try { det.cnn = SufeCNN.locate(det.img.px, det.img.w, det.img.h); } catch (e) { det.cnn = null; }
+    return det.cnn;
+  }
+
+  function runLooseSeg(det) {
+    if (!det || !det.img || det.looseX != null) return det ? det.looseX : null;
+    try { det.looseX = SufeCNN.segmentX(det.img.px, det.img.w, det.img.h); } catch (e) { det.looseX = null; }
+    return det.looseX;
+  }
+
+  // 候选流（懒执行）：
+  //   ① 严格分割可信 → seg 梯队（通常首探测即命中，本地仅 ~2ms）
+  //   ② 分割不可信 → 宽松分割梯队（便宜，2ms）→ 仍需时再跑 CNN（~1-2s）
+  //   ③ ① 全灭 → 同样补「宽松分割 → CNN」（说明渲染与假设不符）
+  //   ④ 盲试兜底
+  function* candidateStream(det) {
+    const seen = new Set();
+    const pick = function* (list) {
+      for (const c of list) {
+        if (seen.has(c.x)) continue;
+        seen.add(c.x);
+        yield c;
+      }
     };
-    const cx = det.cnn ? det.cnn.x : null;
-    push(cx, 'cnn');
-    push(cx + 1, 'cnn+1'); push(cx - 1, 'cnn-1');
-    push(cx + 2, 'cnn+2'); push(cx - 2, 'cnn-2');
-    push(det.segX, 'seg');
-    if (det.segX != null) { push(det.segX + 1, 'seg+1'); push(det.segX - 1, 'seg-1'); }
-    if (!out.length) for (const b of BLIND_X) push(b, 'blind');
-    return out;
+    const cheapThenCnn = function* () {
+      const loose = runLooseSeg(det);
+      if (loose != null) yield* pick(offsets(loose, 'seg'));
+      const cnn = runCnn(det);
+      if (cnn) yield* pick(offsets(cnn.x, 'cnn'));
+    };
+    if (det && det.strict) {
+      yield* pick(offsets(det.strict.x, 'seg'));
+      yield* cheapThenCnn();
+    } else {
+      yield* cheapThenCnn();
+    }
+    for (const b of BLIND_X) yield* pick([{ x: b, m: 'blind' }]);
   }
 
   // ── 滑块与登录核心 ──────────────────────────────────────────────────
@@ -111,29 +149,35 @@
     const d = init && init.data;
     if (!d || !d.token) throw new Error('滑块 init 失败：' + ((init && init.msg) || '未知错误'));
     const y = d.Y, token = d.token;
-    let det = { cnn: null, segX: null };
-    try { det = await detectGap(d); }
+    let det = null;
+    try { det = await decodeAndSegment(d); }
     catch (e) { if (ui) ui.note('背景图解码失败，退回盲试：' + e.message); }
-    const ladder = candidateLadder(det);
+
+    const segShown = () => (det ? (det.strict ? det.strict.x : det.looseX) : null);
+    const cnnShown = () => (det && det.cnn ? Math.round(det.cnn.x) : null);
+    const confShown = () => (det && det.cnn ? det.cnn.conf : 0);
+
     let lastMsg = (init && init.msg) || '';
-    for (const c of ladder) {
+    let first = true;
+    for (const c of candidateStream(det)) {
       const r = await api(
         '/api/v3/sliderCaptcha/check?X=' + encodeURIComponent(c.x) +
         '&Y=' + encodeURIComponent(y) + '&token=' + encodeURIComponent(token)
       );
+      const wasFirst = first;
+      first = false;
       if (String(r.code) === '0') {
-        const first = ladder.length > 0 && c === ladder[0];
-        await recordStat(first, c.x, det.cnn ? det.cnn.conf : null);
+        await recordStat(wasFirst, c.x, confShown());
         return {
-          vcode: r.data, x: c.x, y: y, method: c.m, firstTry: first,
-          cnnX: det.cnn ? Math.round(det.cnn.x) : null, conf: det.cnn ? det.cnn.conf : 0, segX: det.segX,
+          vcode: r.data, x: c.x, y: y, method: c.m, firstTry: wasFirst,
+          cnnX: cnnShown(), conf: confShown(), segX: segShown(),
         };
       }
       lastMsg = r.msg || lastMsg;
     }
     return {
       vcode: null, lastMsg: lastMsg, method: 'none',
-      cnnX: det.cnn ? Math.round(det.cnn.x) : null, conf: det.cnn ? det.cnn.conf : 0, segX: det.segX,
+      cnnX: cnnShown(), conf: confShown(), segX: segShown(),
     };
   }
 
