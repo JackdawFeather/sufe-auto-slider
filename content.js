@@ -17,7 +17,7 @@
   // ── 常量（一般无需修改） ────────────────────────────────────────────
   const BASE = 'https://login.sufe.edu.cn/esc-sso';
   const MAX_ROUNDS = 6;
-  const AUTO_DELAY_MS = 4000;      // 检测到登录页后的倒计时，给用户留取消窗口
+  const AUTO_DELAY_MS = 2000;      // 检测到登录页后的倒计时（保留短暂取消窗口）
   const LOOP_GUARD_MS = 20000;     // 自动登录成功后 20s 内不再自动启动（防死循环）
   const CFG_KEY = 'sufeAutoSliderCfg';
   const STATE_KEY = 'sufeAutoSliderState';
