@@ -14,7 +14,7 @@
   }
   h3 { margin: 0 0 10px; font-size: 15px; color: #1c3f94; }
   label { display: block; margin: 10px 0 4px; color: #555; font-size: 12px; }
-  input[type="text"], input[type="password"] {
+  input[type="text"], input[type="password"], select {
     width: 100%;
     box-sizing: border-box;
     padding: 6px 8px;
@@ -22,6 +22,7 @@
     border-radius: 6px;
     font: inherit;
   }
+  select { background: #fff; }
   .pwd-wrap { position: relative; }
   .pwd-wrap input { padding-right: 54px; }
   .pwd-toggle {
@@ -66,6 +67,12 @@
   <label for="enabled" style="margin:0">自动登录：检测到上财登录页时自动过滑块并登录</label>
 </div>
 
+<label for="trigger">触发方式</label>
+<select id="trigger">
+  <option value="click">点击页面「登录」按钮触发（拦截页面原生登录，扩展自动过滑块）</option>
+  <option value="auto">倒计时自动触发（检测到登录页 2 秒后自动登录）</option>
+</select>
+
 <div class="btns">
   <button id="save" class="primary">保存</button>
   <button id="login">登录</button>
@@ -77,7 +84,9 @@
 
 <div class="tip">
   「登录」直接在当前上财登录页执行（页面未注入脚本时会自动注入，无需刷新）；<br>
-  「测试滑块」只验证滑块可用性、不提交账号。若多轮未通过，多为学校风控收紧期，请稍后再试。
+  「测试滑块」只验证滑块可用性、不提交账号。若多轮未通过，多为学校风控收紧期，请稍后再试。<br>
+  默认「点击页面登录按钮触发」：你点页面上的「登录」时扩展才接管；想让扩展自己启动就选「倒计时自动」。<br>
+  凭据优先用页面输入框：浏览器已填充（或你已手动填好）就直接采用、不覆盖；为空则自动填入此处保存的学号密码。
 </div>
 
 <script src="popup.js"></script>

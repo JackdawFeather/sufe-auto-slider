@@ -1,13 +1,20 @@
 /*
  * 上财自动滑块 · 内容脚本
- * 检测到上财统一认证登录页后：倒计时 → 自动「CNN 缺口定位 + 登录」→ 跳转。
+ * 检测到上财统一认证登录页后，自动「缺口定位 + 登录」→ 跳转。
+ * 触发方式两种（弹窗可切换）：
+ *   click（默认）：点击页面上的「登录」按钮（或表单回车）时接管——拦截页面原生流程，
+ *                 由扩展自动过滑块并登录；
+ *   auto：检测到登录页后倒计时 2 秒自动登录（点击/打字可取消）。
+ * 凭据以页面输入框为准：已有值（浏览器密码管理器填充/手动输入）直接采用、不覆盖；
+ * 为空则把扩展保存的学号密码自动填入登录框后再登录。
  *
  * 滑块策略（整图 CNN + 邻域梯队）：
  *   背景图整图 → sufe-cnn.js（纯 JS 前向）预测「可通过窗口中心」X；先试 0/±1/±2，
  *   再用经典分割兜底（缺口=平坦纯白连通块）与分割邻域，最后才是历史盲试候选。
  *   服务端容差实测：可通过窗口恒为 5 个连续整数（中心 = 缺口左缘-3），故 0/±1/±2 已覆盖全部余量。
  *   失败不会作废 token，同一 token 内可连续校验。
- * 仅向 login.sufe.edu.cn 提交数据，密码 RSA(PKCS#1 v1.5) 加密后传输。
+ * 接口与数据提交均限于当前登录页自身域名（同源）：login.sufe.edu.cn、*.webvpn.sufe.edu.cn
+ * 等代理域名下，请求经代理转发，密码 RSA(PKCS#1 v1.5) 加密后传输。
  */
 (async function () {
   'use strict';
@@ -15,14 +22,18 @@
   window.__SUFE_AUTO_SLIDER__ = true;
 
   // ── 常量（一般无需修改） ────────────────────────────────────────────
-  const BASE = 'https://login.sufe.edu.cn/esc-sso';
+  // 同源接口基址：在 login.sufe.edu.cn 上即 https://login.sufe.edu.cn/esc-sso；
+  // WebVPN 代理域名（*.webvpn.sufe.edu.cn）下同样以页面自身域名走代理
+  const BASE = location.origin + '/esc-sso';
   const MAX_ROUNDS = 6;
-  const AUTO_DELAY_MS = 2000;      // 检测到登录页后的倒计时（保留短暂取消窗口）
+  const AUTO_DELAY_MS = 2000;      // auto 模式：检测到登录页后的倒计时（保留短暂取消窗口）
   const LOOP_GUARD_MS = 20000;     // 自动登录成功后 20s 内不再自动启动（防死循环）
   const CFG_KEY = 'sufeAutoSliderCfg';
   const STATE_KEY = 'sufeAutoSliderState';
   const STATS_KEY = 'sufeAutoSliderStats';
   const BLIND_X = [100, 98, 102];  // 仅在识别完全失败时兜底
+  const ACC_SEL = 'input.f-account, .f-account input, input[name="username"]';
+  const PWD_SEL = 'input.f-pwd, .f-pwd input, input[type="password"]';
 
   // ── 小工具 ──────────────────────────────────────────────────────────
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -343,6 +354,10 @@
     const buttons = err && err.stopRetry
       ? [mkBtn('去设置', openSettings, true), mkBtn('关闭', hideWidget)]
       : [mkBtn('重试', () => startFlow(), true), mkBtn('去设置', openSettings), mkBtn('关闭', hideWidget)];
+    // click 模式下给一条退路：不再拦截页面登录，改用页面自身流程（滑块手动拖）
+    if (clickTriggerEnabled && !clickTriggerDisabled) {
+      buttons.splice(buttons.length - 1, 0, mkBtn('改用页面登录', disableClickTrigger));
+    }
     renderCard('✗ ' + msg, buttons);
   }
 
@@ -362,19 +377,47 @@
     state = 'idle';
   }
 
+  // ── 凭据解析：以页面输入框为准 ──────────────────────────────────────
+  function setFieldValue(input, value) {
+    try {
+      const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value');
+      if (desc && desc.set) desc.set.call(input, value); else input.value = value;
+    } catch (e) { input.value = value; }
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function resolveCredentials(cfg, ui) {
+    const acc = document.querySelector(ACC_SEL);
+    const pwd = document.querySelector(PWD_SEL);
+    const accV = acc && acc.value ? acc.value.trim() : '';
+    const pwdV = pwd ? pwd.value : '';
+    if (accV && pwdV) {
+      if (ui) ui.note('使用页面输入框中的凭据（学号 ' + accV + '）');
+      return { username: accV, password: pwdV };
+    }
+    if (acc && pwd && cfg.username && cfg.password) {
+      setFieldValue(acc, cfg.username);
+      setFieldValue(pwd, cfg.password);
+      if (ui) ui.note('登录框为空，已用扩展保存的凭据自动填入');
+    }
+    return { username: cfg.username || '', password: cfg.password || '' };
+  }
+
   async function startFlow() {
     stopRun();
     const myRunId = ++currentRunId;
     state = 'running';
     const ui = { status: renderStatus, note: renderNote };
     try {
-      const cfg = await getCfg();
-      if (!cfg || !cfg.username || !cfg.password) {
-        const err = new Error('尚未配置学号/密码，请先在扩展设置中填写');
+      const cfg = (await getCfg()) || {};
+      const creds = resolveCredentials(cfg, ui);
+      if (!creds.username || !creds.password) {
+        const err = new Error('页面输入框为空，且扩展未保存学号/密码。请在登录框中填写，或到扩展设置里保存。');
         err.stopRetry = true;
         throw err;
       }
-      const res = await autoLogin(cfg, ui, myRunId);
+      const res = await autoLogin(Object.assign({}, cfg, creds), ui, myRunId);
       if (myRunId !== currentRunId) return;
       state = 'idle';
       const target = extractRedirect(res);
@@ -397,7 +440,7 @@
     state = 'pending';
     let remain = Math.round(AUTO_DELAY_MS / 1000);
     const card = () => renderCard(
-      '检测到上财登录页，' + remain + ' 秒后自动登录（' + cfg.username + '）',
+      '检测到上财登录页，' + remain + ' 秒后自动登录' + (cfg.username ? '（' + cfg.username + '）' : ''),
       [
         mkBtn('立即登录', () => startFlow(), true),
         mkBtn('取消', () => { stopRun(); renderManual(); }),
@@ -431,12 +474,72 @@
     }
   }
 
+  // ── 触发方式：click = 点击页面「登录」按钮时接管；auto = 倒计时自动 ──
+  // 页面原生登录按钮实测为 button.pc-login（含隐藏的短信登录面板同款按钮）；
+  // 在 capture 阶段拦截点击/回车/表单提交，阻止页面自己的滑块流程，改走扩展自动流程。
+  const LOGIN_BTN_SEL = 'button.pc-login, button.login-btn';
+  const LOGIN_INPUT_SEL = ACC_SEL + ', ' + PWD_SEL;
+  let clickTriggerEnabled = false;
+  let clickTriggerDisabled = false;
+
+  function installClickTrigger() {
+    clickTriggerEnabled = true;
+    const takeOver = (e) => {
+      if (clickTriggerDisabled) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (state === 'running') return;
+      startFlow();
+    };
+    const onClick = (e) => {
+      if (!(e.target instanceof Element) || e.target.closest('#' + WIDGET_ID)) return;
+      if (!e.target.closest(LOGIN_BTN_SEL)) return;
+      takeOver(e);
+    };
+    const onSubmit = (e) => {
+      if (e.target instanceof Element && e.target.closest('#' + WIDGET_ID)) return;
+      takeOver(e);
+    };
+    const onKey = (e) => {
+      if (e.key !== 'Enter') return;
+      if (!(e.target instanceof Element) || e.target.closest('#' + WIDGET_ID)) return;
+      if (!e.target.closest(LOGIN_INPUT_SEL)) return;
+      takeOver(e);
+    };
+    document.addEventListener('click', onClick, true);
+    document.addEventListener('submit', onSubmit, true);
+    document.addEventListener('keydown', onKey, true);
+  }
+
+  function disableClickTrigger() {
+    clickTriggerDisabled = true;
+    renderCard('已改用页面原生登录：点击页面「登录」按钮将走页面自身流程（本页内扩展不再接管）。', [
+      mkBtn('恢复自动接管', () => { clickTriggerDisabled = false; startFlow(); }, true),
+      mkBtn('关闭', hideWidget),
+    ]);
+  }
+
+  function startEntry(c) {
+    c = c || {};
+    if ((c.triggerMode || 'click') === 'auto') {
+      document.addEventListener('pointerdown', onUserInteract, true);
+      document.addEventListener('input', onUserInteract, true);
+      startCountdown(c);
+      return;
+    }
+    installClickTrigger();
+    const buttons = [mkBtn('立即登录', () => startFlow(), true)];
+    if (!c.username || !c.password) buttons.push(mkBtn('去设置', openSettings));
+    buttons.push(mkBtn('关闭', hideWidget));
+    renderCard('检测到上财登录页：点击页面上的「登录」按钮，将自动完成滑块验证并登录（凭据优先用页面输入框，空则用扩展保存的）。', buttons);
+  }
+
   // ── 检测登录页（SPA 渲染需要等待） ─────────────────────────────────
   async function waitForForm(timeoutMs) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
-      const acc = document.querySelector('input.f-account, .f-account input, input[name="username"]');
-      const pwd = document.querySelector('input.f-pwd, .f-pwd input, input[type="password"]');
+      const acc = document.querySelector(ACC_SEL);
+      const pwd = document.querySelector(PWD_SEL);
       if (acc && pwd) return { acc: acc, pwd: pwd };
       await sleep(300);
     }
@@ -472,16 +575,13 @@
     return;
   }
 
-  // 闭环自检触发：访问 login.sufe.edu.cn/login/#sufe-test-slider
-  // 只跑滑块验证（不提交账号密码），结果显示在浮窗中。
+  // 闭环自检触发：在任意支持的登录页 URL 后加 #sufe-test-slider
+  // （如 login.sufe.edu.cn/login/#sufe-test-slider）；只跑滑块验证（不提交账号密码），结果显示在浮窗中。
   if (location.hash.indexOf('sufe-test-slider') >= 0) {
     const r = await testSlider(3);
     renderCard(r.ok ? '✓ ' + r.detail : '✗ ' + r.detail, [mkBtn('关闭', hideWidget)]);
     return;
   }
-
-  document.addEventListener('pointerdown', onUserInteract, true);
-  document.addEventListener('input', onUserInteract, true);
 
   const st = await getState();
   if (st.lastAutoLoginAt && Date.now() - st.lastAutoLoginAt < LOOP_GUARD_MS) {
@@ -492,27 +592,19 @@
     return;
   }
 
-  if (!cfg || !cfg.username || !cfg.password) {
-    renderCard('上财自动滑块：尚未配置学号/密码，无法自动登录。', [
-      mkBtn('去设置', openSettings, true),
-      mkBtn('关闭', hideWidget),
-    ]);
-    return;
-  }
-
-  if (cfg.enabled === false) {
+  if (cfg && cfg.enabled === false) {
     renderCard('上财自动滑块：自动登录已停用。', [
       mkBtn('本次登录', () => startFlow(), true),
       mkBtn('启用', async () => {
-        const c = await getCfg();
+        const c = (await getCfg()) || {};
         c.enabled = true;
         await chrome.storage.local.set({ [CFG_KEY]: c });
-        startCountdown(c);
+        startEntry(c);
       }),
       mkBtn('关闭', hideWidget),
     ]);
     return;
   }
 
-  startCountdown(cfg);
+  startEntry(cfg || {});
 })();

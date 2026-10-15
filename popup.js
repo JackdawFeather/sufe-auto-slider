@@ -1,10 +1,21 @@
 const CFG_KEY = 'sufeAutoSliderCfg';
-const LOGIN_URL_PREFIX = 'https://login.sufe.edu.cn/';
+
+// login.sufe.edu.cn 任意路径，或任意 *.sufe.edu.cn 的 /login* 页面（含 WebVPN 代理域名）
+function isLoginPageUrl(url) {
+  if (!url) return false;
+  if (url.startsWith('https://login.sufe.edu.cn/')) return true;
+  let u;
+  try { u = new URL(url); } catch (e) { return false; }
+  return u.protocol === 'https:' &&
+    /(^|\.)sufe\.edu\.cn$/.test(u.hostname) &&
+    u.pathname.startsWith('/login');
+}
 
 const $username = document.getElementById('username');
 const $password = document.getElementById('password');
 const $togglePwd = document.getElementById('togglePwd');
 const $enabled = document.getElementById('enabled');
+const $trigger = document.getElementById('trigger');
 const $save = document.getElementById('save');
 const $login = document.getElementById('login');
 const $test = document.getElementById('test');
@@ -21,6 +32,7 @@ chrome.storage.local.get(CFG_KEY).then((o) => {
   $username.value = cfg.username || '';
   $password.value = cfg.password || '';
   $enabled.checked = cfg.enabled !== false;
+  $trigger.value = cfg.triggerMode === 'auto' ? 'auto' : 'click';
 });
 
 chrome.storage.local.get('sufeAutoSliderStats').then((o) => {
@@ -42,25 +54,26 @@ $save.addEventListener('click', async () => {
     username: $username.value.trim(),
     password: $password.value,
     enabled: $enabled.checked,
+    triggerMode: $trigger.value,
   };
   if (!cfg.username || !cfg.password) {
     setStatus('请填写学号和密码。', true);
     return;
   }
   await chrome.storage.local.set({ [CFG_KEY]: cfg });
-  setStatus('已保存 ✓ 刷新上财登录页即可自动登录。');
+  setStatus('已保存 ✓ 刷新上财登录页即可生效。');
 });
 
 async function activeLoginTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.url || !tab.url.startsWith(LOGIN_URL_PREFIX)) return null;
+  if (!tab || !tab.url || !isLoginPageUrl(tab.url)) return null;
   return tab;
 }
 
 $login.addEventListener('click', async () => {
   const tab = await activeLoginTab();
   if (!tab) {
-    setStatus('请先在当前标签页打开上财登录页（login.sufe.edu.cn），再点「登录」。', true);
+    setStatus('请先在当前标签页打开上财登录页（login.sufe.edu.cn 或 *.sufe.edu.cn/login），再点「登录」。', true);
     return;
   }
   setStatus('正在登录…（结果见页面右上角浮窗）');
@@ -88,7 +101,7 @@ $login.addEventListener('click', async () => {
 $test.addEventListener('click', async () => {
   const tab = await activeLoginTab();
   if (!tab) {
-    setStatus('请先打开上财登录页（login.sufe.edu.cn）标签页，再点击测试。', true);
+    setStatus('请先打开上财登录页（login.sufe.edu.cn 或 *.sufe.edu.cn/login）标签页，再点击测试。', true);
     return;
   }
   setStatus('测试中（最多 3 轮，约 10 秒）…');
