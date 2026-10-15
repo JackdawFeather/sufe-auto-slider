@@ -73,7 +73,7 @@ async function activeLoginTab() {
 $login.addEventListener('click', async () => {
   const tab = await activeLoginTab();
   if (!tab) {
-    setStatus('请先在当前标签页打开上财登录页（login.sufe.edu.cn 或 *.sufe.edu.cn/login），再点「登录」。', true);
+    setStatus('请先打开上财登录页（login.sufe.edu.cn / *.sufe.edu.cn/login）', true);
     return;
   }
   setStatus('正在登录…（结果见页面右上角浮窗）');
@@ -101,7 +101,7 @@ $login.addEventListener('click', async () => {
 $test.addEventListener('click', async () => {
   const tab = await activeLoginTab();
   if (!tab) {
-    setStatus('请先打开上财登录页（login.sufe.edu.cn 或 *.sufe.edu.cn/login）标签页，再点击测试。', true);
+    setStatus('请先打开上财登录页（login.sufe.edu.cn / *.sufe.edu.cn/login）', true);
     return;
   }
   setStatus('测试中（最多 3 轮，约 10 秒）…');

@@ -393,13 +393,13 @@
     const accV = acc && acc.value ? acc.value.trim() : '';
     const pwdV = pwd ? pwd.value : '';
     if (accV && pwdV) {
-      if (ui) ui.note('使用页面输入框中的凭据（学号 ' + accV + '）');
+      if (ui) ui.note('用页面输入框凭据（' + accV + '）');
       return { username: accV, password: pwdV };
     }
     if (acc && pwd && cfg.username && cfg.password) {
       setFieldValue(acc, cfg.username);
       setFieldValue(pwd, cfg.password);
-      if (ui) ui.note('登录框为空，已用扩展保存的凭据自动填入');
+      if (ui) ui.note('登录框为空，已填入扩展保存的凭据');
     }
     return { username: cfg.username || '', password: cfg.password || '' };
   }
@@ -413,7 +413,7 @@
       const cfg = (await getCfg()) || {};
       const creds = resolveCredentials(cfg, ui);
       if (!creds.username || !creds.password) {
-        const err = new Error('页面输入框为空，且扩展未保存学号/密码。请在登录框中填写，或到扩展设置里保存。');
+        const err = new Error('登录框为空，扩展也未保存学号/密码');
         err.stopRetry = true;
         throw err;
       }
@@ -440,7 +440,7 @@
     state = 'pending';
     let remain = Math.round(AUTO_DELAY_MS / 1000);
     const card = () => renderCard(
-      '检测到上财登录页，' + remain + ' 秒后自动登录' + (cfg.username ? '（' + cfg.username + '）' : ''),
+      '检测到登录页：' + remain + ' 秒后自动登录' + (cfg.username ? '（' + cfg.username + '）' : ''),
       [
         mkBtn('立即登录', () => startFlow(), true),
         mkBtn('取消', () => { stopRun(); renderManual(); }),
@@ -513,7 +513,7 @@
 
   function disableClickTrigger() {
     clickTriggerDisabled = true;
-    renderCard('已改用页面原生登录：点击页面「登录」按钮将走页面自身流程（本页内扩展不再接管）。', [
+    renderCard('已改用页面原生登录（本页不再接管）', [
       mkBtn('恢复自动接管', () => { clickTriggerDisabled = false; startFlow(); }, true),
       mkBtn('关闭', hideWidget),
     ]);
@@ -531,7 +531,7 @@
     const buttons = [mkBtn('立即登录', () => startFlow(), true)];
     if (!c.username || !c.password) buttons.push(mkBtn('去设置', openSettings));
     buttons.push(mkBtn('关闭', hideWidget));
-    renderCard('检测到上财登录页：点击页面上的「登录」按钮，将自动完成滑块验证并登录（凭据优先用页面输入框，空则用扩展保存的）。', buttons);
+    renderCard('点击页面上的「登录」按钮，自动过滑块登录', buttons);
   }
 
   // ── 检测登录页（SPA 渲染需要等待） ─────────────────────────────────
