@@ -30,8 +30,6 @@
   const BASE = location.origin + '/esc-sso';
   const MAX_ROUNDS = 6;
   const VCODE_MAX_ROUNDS = 6;      // 图片验证码模式：提交轮数（实测单次约 75%）
-  const VCODE_CONF_MIN = 0.85;     // 低于此置信度先换图重识别，不浪费提交（概率决策）
-  const VCODE_REFETCH_MAX = 3;     // 低置信换图重识别的最多次数
   const AUTO_DELAY_MS = 2000;      // auto 模式：检测到登录页后的倒计时（保留短暂取消窗口）
   const LOOP_GUARD_MS = 20000;     // 自动登录成功后 20s 内不再自动启动（防死循环）
   const CFG_KEY = 'sufeAutoSliderCfg';
@@ -270,16 +268,12 @@
   }
 
   // 图片验证码模式：拉图 → 纯 JS OCR → 登录；SSO10023（验证码错误）换图重试
-  // 概率决策：识别置信度低于 VCODE_CONF_MIN 时先换图重识别（不计提交轮次），减少无效提交
+  // 置信度只用于日志展示（实测「低置信先换图」在 E[T] 上不划算，算完直接提交）
   async function vcodeLogin(cfg, param, ticket, ui, runId) {
     const checkStop = () => { if (runId !== currentRunId) throw new Error('已停止'); };
-    let submitted = 0, refetched = 0, steps = 0;
-    while (submitted < VCODE_MAX_ROUNDS) {
+    for (let rnd = 1; rnd <= VCODE_MAX_ROUNDS; rnd++) {
       checkStop();
-      if (++steps > VCODE_MAX_ROUNDS + VCODE_REFETCH_MAX + 4) {
-        throw new Error('图片验证码多次尝试未通过，可在扩展设置中改用「滑块」或稍后重试');
-      }
-      ui.status('图片验证码识别中（第 ' + (submitted + 1) + '/' + VCODE_MAX_ROUNDS + ' 轮）…');
+      ui.status('图片验证码识别中（第 ' + rnd + '/' + VCODE_MAX_ROUNDS + ' 轮）…');
       let rec = null;
       try {
         const img = await fetchRandcode();
@@ -294,15 +288,7 @@
         await sleep(500);
         continue;
       }
-      const confPct = Math.round(rec.conf * 100);
-      if (rec.conf < VCODE_CONF_MIN && refetched < VCODE_REFETCH_MAX) {
-        refetched++;
-        ui.note('置信度偏低（' + confPct + '%），换图重识别（' + refetched + '/' + VCODE_REFETCH_MAX + '）');
-        await sleep(250);
-        continue;
-      }
-      ui.note('验证码识别为 ' + rec.text + '（' + confPct + '%）');
-      submitted++;
+      ui.note('验证码识别为 ' + rec.text + '（' + Math.round(rec.conf * 100) + '%）');
       checkStop();
       ui.status('正在登录…');
       const res = await submitLogin(cfg, param, ticket, rec.text);
