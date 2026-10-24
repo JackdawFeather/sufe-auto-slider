@@ -7,6 +7,9 @@
  *   auto：检测到登录页后倒计时 2 秒自动登录（点击/打字可取消）。
  * 凭据以页面输入框为准：已有值（浏览器密码管理器填充/手动输入）直接采用、不覆盖；
  * 为空则把扩展保存的学号密码自动填入登录框后再登录。
+ * 验证码两种模式（服务端按会话下发，自动检测）：
+ *   slidercaptcha：拖动拼图（init → 分割/CNN 定位 → check）
+ *   vcode：图片验证码（getRandcode → 纯 JS OCR → 随 doLogin 提交，错码自动换图重试）
  *
  * 滑块策略（整图 CNN + 邻域梯队）：
  *   背景图整图 → sufe-cnn.js（纯 JS 前向）预测「可通过窗口中心」X；先试 0/±1/±2，
@@ -26,6 +29,7 @@
   // WebVPN 代理域名（*.webvpn.sufe.edu.cn）下同样以页面自身域名走代理
   const BASE = location.origin + '/esc-sso';
   const MAX_ROUNDS = 6;
+  const VCODE_MAX_ROUNDS = 6;      // 图片验证码模式：换图重试轮数（单次实测约 62%，6 轮约 99.7%）
   const AUTO_DELAY_MS = 2000;      // auto 模式：检测到登录页后的倒计时（保留短暂取消窗口）
   const LOOP_GUARD_MS = 20000;     // 自动登录成功后 20s 内不再自动启动（防死循环）
   const CFG_KEY = 'sufeAutoSliderCfg';
@@ -229,6 +233,87 @@
     return null;
   }
 
+  async function submitLogin(cfg, param, ticket, vcode) {
+    const encPw = SufeCrypto.encryptPassword(cfg.password, param.publicKey);
+    return api('/api/v3/auth/doLogin', {
+      method: 'POST',
+      body: {
+        authType: 'webLocalAuth',
+        dataField: {
+          username: cfg.username,
+          password: encPw,
+          vcode: vcode,
+          publicKeyId: param.publicKeyId,
+        },
+        loginTicket: ticket,
+        redirectUri: '',
+      },
+    });
+  }
+
+  async function fetchRandcode() {
+    const res = await fetch(BASE + '/api/v1/image/getRandcode?' + Date.now(), {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+    if (!res.ok) throw new Error('下载验证码图片失败（HTTP ' + res.status + '）');
+    const bmp = await createImageBitmap(await res.blob());
+    const cv = document.createElement('canvas');
+    cv.width = bmp.width; cv.height = bmp.height;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bmp, 0, 0);
+    const id = ctx.getImageData(0, 0, cv.width, cv.height);
+    if (bmp.close) bmp.close();
+    return id;
+  }
+
+  // 图片验证码模式：拉图 → 纯 JS OCR → 登录；SSO10023（验证码错误）换图重试
+  async function vcodeLogin(cfg, param, ticket, ui, runId) {
+    const checkStop = () => { if (runId !== currentRunId) throw new Error('已停止'); };
+    for (let rnd = 1; rnd <= VCODE_MAX_ROUNDS; rnd++) {
+      checkStop();
+      ui.status('图片验证码识别中（第 ' + rnd + '/' + VCODE_MAX_ROUNDS + ' 轮）…');
+      let rec = null;
+      try {
+        const img = await fetchRandcode();
+        rec = SufeVcode.recognize(img.data, img.width, img.height);
+      } catch (e) {
+        ui.note('验证码识别失败：' + e.message);
+        await sleep(backoff(rnd));
+        continue;
+      }
+      if (!rec || !rec.text || rec.text.length < 3) {
+        ui.note('识别结果异常（' + ((rec && rec.text) || '空') + '），换图重试');
+        await sleep(600);
+        continue;
+      }
+      ui.note('验证码识别为 ' + rec.text + '（' + Math.round(rec.conf * 100) + '%）');
+      checkStop();
+      ui.status('正在登录…');
+      const res = await submitLogin(cfg, param, ticket, rec.text);
+      checkStop();
+      if (String(res.code) === '0') {
+        await chrome.storage.local.set({ [STATE_KEY]: { lastAutoLoginAt: Date.now() } });
+        return res;
+      }
+      if (String(res.code) === 'SSO10023') {
+        ui.note('验证码未通过，换图重试');
+        await sleep(700);
+        continue;
+      }
+      if (res.code === 'SSO10002' || res.code === 'SSO10001') {
+        const err = new Error(res.code === 'SSO10001'
+          ? '学号不存在（SSO10001），请在扩展设置中更正'
+          : '学号或密码错误（SSO10002），请在扩展设置中更正');
+        err.stopRetry = true;
+        throw err;
+      }
+      ui.note('doLogin 未通过：code=' + (res.code || '?') + ' msg=' + (res.msg || ''));
+      await sleep(1500);
+    }
+    throw new Error('图片验证码连续 ' + VCODE_MAX_ROUNDS + ' 轮未通过，请稍后再试或手动登录');
+  }
+
   async function autoLogin(cfg, ui, runId) {
     const checkStop = () => { if (runId !== currentRunId) throw new Error('已停止'); };
 
@@ -239,7 +324,10 @@
     if (!param || !param.publicKey || !ticket) throw new Error('获取登录配置失败（接口结构可能已变化）');
     checkStop();
 
-    const encPw = SufeCrypto.encryptPassword(cfg.password, param.publicKey);
+    const wla = cfgRes.data.login && cfgRes.data.login.webLocalAuth;
+    if (wla && (String(wla.displayVcode) === '1' || String(wla.type) === 'vcode')) {
+      return await vcodeLogin(cfg, param, ticket, ui, runId);
+    }
 
     for (let rnd = 1; rnd <= MAX_ROUNDS; rnd++) {
       checkStop();
@@ -256,20 +344,7 @@
       }
       checkStop();
       ui.status('滑块已解锁（X=' + v.x + ' 方式=' + v.method + '），正在登录…');
-      const res = await api('/api/v3/auth/doLogin', {
-        method: 'POST',
-        body: {
-          authType: 'webLocalAuth',
-          dataField: {
-            username: cfg.username,
-            password: encPw,
-            vcode: v.vcode,
-            publicKeyId: param.publicKeyId,
-          },
-          loginTicket: ticket,
-          redirectUri: '',
-        },
-      });
+      const res = await submitLogin(cfg, param, ticket, v.vcode);
       checkStop();
       if (String(res.code) === '0') {
         await chrome.storage.local.set({ [STATE_KEY]: { lastAutoLoginAt: Date.now() } });
@@ -531,7 +606,7 @@
     const buttons = [mkBtn('立即登录', () => startFlow(), true)];
     if (!c.username || !c.password) buttons.push(mkBtn('去设置', openSettings));
     buttons.push(mkBtn('关闭', hideWidget));
-    renderCard('点击页面上的「登录」按钮，自动过滑块登录', buttons);
+    renderCard('点击页面上的「登录」按钮，自动完成验证并登录', buttons);
   }
 
   // ── 检测登录页（SPA 渲染需要等待） ─────────────────────────────────

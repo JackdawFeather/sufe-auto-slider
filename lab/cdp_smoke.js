@@ -11,6 +11,8 @@
  *  4b) 凭据策略：预填页面输入框（模拟浏览器填充）→ 登录用页面值、不覆盖
  *  5) 真实回归（默认执行，--skip-real-e2e 跳过）：真登录页点击原生「登录」按钮 + 假学号全链路 → 期待 SSO10001
  *  6) auto 模式回归：切 triggerMode=auto → 替身页出现倒计时卡片
+ *  7) vcode 模式（mock）：queryAllValid 返回 displayVcode=1 → 拉图 OCR → 首次 doLogin 返回 SSO10023
+ *     检验换图重试 → 再次返回 SSO10001；断言不调用滑块接口、vcode 均为 4 位小写字母数字
  *
  * 退出码：0 全部通过；1 有断言失败；2 致命错误。截图输出到 lab/output/。
  */
@@ -155,6 +157,17 @@ async function main() {
     const p2 = await newPage('about:blank');
     const intercepted = [];
     const doLoginBodies = [];
+    let vcodeMode = false;          // 步骤 7 打开：queryAllValid 返回 displayVcode=1
+    let randcodeCalls = 0;
+    let initCallsVcode = 0;
+    const doLoginVcodes = [];
+    // 图片验证码 mock 图：取一张真实样本
+    const vcodeDir = path.join(REPO, 'lab', 'samples', 'vcode');
+    let randcodeB64 = '';
+    try {
+      const jpgs = fs.readdirSync(vcodeDir).filter((f) => f.endsWith('.jpg')).sort();
+      randcodeB64 = fs.readFileSync(path.join(vcodeDir, jpgs[0])).toString('base64');
+    } catch (e) { /* 无样本时 mock 返回空图，让识别失败暴露 */ }
     const bgB64 = fs.readFileSync(path.join(REPO, 'samples', '0000', 'bg.png')).toString('base64');
     const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
     const jsonRes = (obj) => ({ code: 200, headers: [{ name: 'Content-Type', value: 'application/json; charset=utf-8' }], body: b64(JSON.stringify(obj)) });
@@ -164,14 +177,33 @@ async function main() {
       const url = p.request.url;
       intercepted.push(url);
       let res;
-      if (url.includes('/api/v3/auth/queryAllValid')) res = jsonRes(qa);
-      else if (url.includes('/api/v3/sliderCaptcha/init')) res = jsonRes({ code: '0', data: { sourceImage: bgB64, newImage: '', Y: 120, token: 'smoke-token' } });
-      else if (url.includes('/api/v3/sliderCaptcha/check')) res = jsonRes({ code: '0', data: 'SMOKE-VCODE' });
+      if (url.includes('/api/v3/auth/queryAllValid')) {
+        if (vcodeMode) {
+          const qa2 = JSON.parse(JSON.stringify(qa));
+          qa2.data.login.webLocalAuth.displayVcode = '1';
+          res = jsonRes(qa2);
+        } else res = jsonRes(qa);
+      } else if (url.includes('/api/v1/image/getRandcode')) {
+        randcodeCalls++;
+        res = { code: 200, headers: [{ name: 'Content-Type', value: 'image/jpeg' }], body: randcodeB64 };
+      } else if (url.includes('/api/v3/sliderCaptcha/init')) {
+        if (vcodeMode) initCallsVcode++;
+        res = jsonRes({ code: '0', data: { sourceImage: bgB64, newImage: '', Y: 120, token: 'smoke-token' } });
+      } else if (url.includes('/api/v3/sliderCaptcha/check')) res = jsonRes({ code: '0', data: 'SMOKE-VCODE' });
       else if (url.includes('/api/v3/auth/doLogin')) {
-        try { doLoginBodies.push(JSON.parse(p.request.postData || '{}')); } catch (e) { doLoginBodies.push({}); }
-        res = jsonRes({ code: 'SSO10001', msg: '学号不存在' });
-      }
-      else if (url.endsWith('/favicon.ico')) res = { code: 404, headers: [], body: '' };
+        let body = {};
+        try { body = JSON.parse(p.request.postData || '{}'); } catch (e) { /* ignore */ }
+        doLoginBodies.push(body);
+        if (vcodeMode) {
+          doLoginVcodes.push(body.dataField && body.dataField.vcode);
+          // 第一次故意返回 SSO10023（验证码错误）检验换图重试
+          res = jsonRes(doLoginVcodes.length === 1
+            ? { code: 'SSO10023', msg: '图片验证码错误' }
+            : { code: 'SSO10001', msg: '学号不存在' });
+        } else {
+          res = jsonRes({ code: 'SSO10001', msg: '学号不存在' });
+        }
+      } else if (url.endsWith('/favicon.ico')) res = { code: 404, headers: [], body: '' };
       else res = htmlRes(fakeHtml);
       browser.cmd('Fetch.fulfillRequest', { requestId: p.requestId, responseCode: res.code, responseHeaders: res.headers, body: res.body }, sid).catch(() => {});
     });
@@ -247,6 +279,27 @@ async function main() {
     await browser.cmd('Page.navigate', { url: FAKE_URL }, p2.sid);
     const cdAuto = await browser.waitFor(p2.sid, WIDGET + ".includes('秒后自动登录') ? 'yes' : ''", 10000);
     check('auto 模式回归：替身页出现倒计时卡片', !!cdAuto);
+
+    // 7) 图片验证码模式（mock）：displayVcode=1 → 拉图 OCR → 首次 SSO10023 换图重试 → SSO10001
+    //    先把触发方式切回 click（步骤 6 改成了 auto）
+    const pop3 = await newPage('chrome-extension://' + ext.id + '/popup.html');
+    await browser.waitFor(pop3.sid, "document.readyState === 'complete' ? 'ok' : ''", 15000);
+    await browser.eval(pop3.sid,
+      "chrome.storage.local.get('sufeAutoSliderCfg').then(o => { const c = o.sufeAutoSliderCfg; c.triggerMode = 'click'; return chrome.storage.local.set({sufeAutoSliderCfg: c}); }).then(() => 'ok')", true);
+    await browser.cmd('Target.closeTarget', { targetId: pop3.targetId });
+    vcodeMode = true;
+    await browser.cmd('Page.navigate', { url: FAKE_URL }, p2.sid);
+    const cdV = await browser.waitFor(p2.sid, WIDGET + ".includes('点击页面上的「登录」按钮') ? 'yes' : ''", 15000);
+    if (!cdV) await dumpWidget(p2.sid);
+    await browser.eval(p2.sid, "document.querySelector('button.pc-login').click(); 'clicked'");
+    const t5 = await browser.waitFor(p2.sid, WIDGET + ".includes('学号不存在') ? 'yes' : ''", 60000);
+    if (!t5) await dumpWidget(p2.sid);
+    const vcodesOk = doLoginVcodes.length >= 2 && doLoginVcodes.every((v) => /^[0-9a-z]{4}$/.test(String(v)));
+    check('vcode 模式：OCR 提交 + SSO10023 换图重试 → SSO10001（且不调滑块接口）',
+      !!cdV && !!t5 && randcodeCalls >= 2 && vcodesOk && initCallsVcode === 0,
+      'randcode=' + randcodeCalls + ' doLogin=' + doLoginVcodes.length +
+      ' vcodes=' + JSON.stringify(doLoginVcodes) + ' init(vcode)=' + initCallsVcode);
+    await shot(p2.targetId, p2.sid, 'smoke-5-vcode-mode.png');
   } finally {
     try { if (browser) await browser.cmd('Browser.close'); } catch (e) { /* ignore */ }
     await sleep(1500);
