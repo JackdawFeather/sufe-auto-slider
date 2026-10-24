@@ -25,19 +25,20 @@ OUT = os.path.join(HERE, "output", "vcode")
 
 
 class Net4(nn.Module):
-    def __init__(self, nclass):
+    def __init__(self, nclass, width=24):
         super().__init__()
-        self.c1 = nn.Conv2d(1, 24, 3, padding=1)
-        self.n1 = nn.BatchNorm2d(24)
-        self.c2 = nn.Conv2d(24, 48, 3, padding=1)
-        self.n2 = nn.BatchNorm2d(48)
-        self.c3 = nn.Conv2d(48, 48, 3, padding=1)
-        self.n3 = nn.BatchNorm2d(48)
-        self.c4 = nn.Conv2d(48, 96, 3, padding=1)
-        self.n4 = nn.BatchNorm2d(96)
-        self.c5 = nn.Conv2d(96, 96, 3, padding=1)
-        self.n5 = nn.BatchNorm2d(96)
-        self.head = nn.Linear(96, nclass)
+        w = width
+        self.c1 = nn.Conv2d(1, w, 3, padding=1)
+        self.n1 = nn.BatchNorm2d(w)
+        self.c2 = nn.Conv2d(w, 2 * w, 3, padding=1)
+        self.n2 = nn.BatchNorm2d(2 * w)
+        self.c3 = nn.Conv2d(2 * w, 2 * w, 3, padding=1)
+        self.n3 = nn.BatchNorm2d(2 * w)
+        self.c4 = nn.Conv2d(2 * w, 4 * w, 3, padding=1)
+        self.n4 = nn.BatchNorm2d(4 * w)
+        self.c5 = nn.Conv2d(4 * w, 4 * w, 3, padding=1)
+        self.n5 = nn.BatchNorm2d(4 * w)
+        self.head = nn.Linear(4 * w, nclass)
 
     def forward(self, x):
         x = torch.nn.functional.max_pool2d(torch.relu(self.n1(self.c1(x))), (2, 2))
@@ -117,6 +118,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--no-aug", action="store_true")
+    ap.add_argument("--width", type=int, default=24, help="主干基础通道（24=标准，16≈提速 2 倍）")
     args = ap.parse_args()
 
     labels = json.load(open(os.path.join(OUT, "labels.json"), encoding="utf-8"))
@@ -127,11 +129,18 @@ def main():
             data.append((f, t))
     random.seed(7)
     random.shuffle(data)
+    # 黄金人工标注集不进训练（保证评估诚实）
+    golden_path = os.path.join(OUT, "golden_files.txt")
+    if os.path.exists(golden_path):
+        gold = set(open(golden_path).read().split())
+        before = len(data)
+        data = [d for d in data if d[0] not in gold]
+        print("排除黄金集 %d 张（剩 %d）" % (before - len(data), len(data)), flush=True)
     nval = max(60, len(data) // 10)
     val, train = data[:nval], data[nval:]
     print("训练 %d / 验证 %d" % (len(train), len(val)), flush=True)
 
-    net = Net4(len(CHARSET))
+    net = Net4(len(CHARSET), args.width)
     print("参数量 %.1fk" % (sum(p.numel() for p in net.parameters()) / 1000), flush=True)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=max(8, args.epochs // 3), gamma=0.5)
@@ -177,6 +186,23 @@ def main():
                 tok, tn, 100.0 * tok / tn, 100.0 * tc / (4 * tn), time.time() - t0), flush=True)
 
     export(net, val)
+    # 保存带尺寸/宽度标识的检查点，并做黄金集评估（黄金集已从训练中排除）
+    import shutil
+    shutil.copy(os.path.join(OUT, "ckpt4.pt"),
+                os.path.join(OUT, "ckpt4_w%d_%dx%d.pt" % (args.width, IN_W, IN_H)))
+    gp = os.path.join(OUT, "golden.json")
+    if os.path.exists(gp):
+        g = json.load(open(gp, encoding="utf-8"))
+        net.eval()
+        ok = 0
+        with torch.no_grad():
+            for gf, gt in g.items():
+                im = cv2.imread(os.path.join(SAMPLES, gf))
+                x = torch.from_numpy(to_input(im)[None, None].astype(np.float32))
+                pr, _ = decode(net(x))
+                ok += (pr == gt)
+        print("黄金集: %d/%d = %.0f%%（in %dx%d, width=%d）" % (
+            ok, len(g), 100.0 * ok / len(g), IN_W, IN_H, args.width), flush=True)
 
 
 if __name__ == "__main__":

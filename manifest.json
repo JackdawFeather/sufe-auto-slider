@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "上财自动滑块",
-  "version": "4.2.1",
+  "version": "4.2.2",
   "description": "检测上海财经大学统一认证登录页（login.sufe.edu.cn，或任意 *.sufe.edu.cn/login，含 WebVPN 代理域名），自动完成滑块/图片验证码并登录。仅限本人账号使用。",
   "permissions": ["storage", "scripting"],
   "host_permissions": ["https://login.sufe.edu.cn/*", "https://*.sufe.edu.cn/login*"],

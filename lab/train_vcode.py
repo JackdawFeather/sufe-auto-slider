@@ -25,7 +25,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SAMPLES = os.path.join(HERE, "samples", "vcode")
 OUT = os.path.join(HERE, "output", "vcode")
 CHARSET = "0123456789abcdefghijklmnopqrstuvwxyz"  # blank = 0，字符从 1 开始
-IN_W, IN_H = 128, 48
+IN_W = int(os.environ.get("VCODE_IN_W", "128"))
+IN_H = int(os.environ.get("VCODE_IN_H", "48"))
 
 
 _SIZE_CACHE = {}

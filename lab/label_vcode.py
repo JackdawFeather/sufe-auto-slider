@@ -31,12 +31,20 @@ def variants(img):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--incremental", action="store_true", help="只标注新增样本（保留已有 labels.json）")
+    args = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     ocr = ddddocr.DdddOcr(show_ad=False)
     files = sorted(glob.glob(os.path.join(SAMPLES, "*.jpg")))
-    print("images:", len(files), flush=True)
+    lab_path = os.path.join(OUT, "labels.json")
     rec = {}
-    for k, f in enumerate(files):
+    if args.incremental and os.path.exists(lab_path):
+        rec = json.load(open(lab_path, encoding="utf-8"))
+    todo = [f for f in files if os.path.basename(f) not in rec]
+    print("images:", len(files), "| 已有:", len(rec), "| 待标注:", len(todo), flush=True)
+    for k, f in enumerate(todo):
         img = cv2.imread(f)
         if img is None:
             continue

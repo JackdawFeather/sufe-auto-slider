@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 HERE = __file__.rsplit("\\", 1)[0].rsplit("/", 1)[0]
 BASE = "https://login.sufe.edu.cn/esc-sso"
-N = int(sys.argv[1]) if sys.argv[1:] else 8
+N = int(sys.argv[1]) if sys.argv[1:] else 12
 
 S = requests.Session()
 S.headers.update({
@@ -47,7 +47,9 @@ def do_login(code):
 
 def main():
     hit = 0
+    t_net = []
     for i in range(N):
+        t0 = time.time()
         img = S.get(BASE + "/api/v1/image/getRandcode?" + str(random.random()), timeout=20).content
         arr = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
         h, w = arr.shape[:2]
@@ -55,20 +57,28 @@ def main():
         bin_path = "lab/output/vcode/api_test.bin"
         with open(bin_path, "wb") as f:
             f.write(rgba)
+        t1 = time.time()
         out = subprocess.run(["node", "lab/vcode_ocr_cli.js", bin_path, str(w), str(h)],
                              capture_output=True, text=True).stdout
+        t2 = time.time()
         try:
             rec = json.loads(out)
         except Exception:
             rec = {"text": "", "conf": 0}
         code = rec["text"]
         r = do_login(code) if code else {"code": "EMPTY"}
+        t3 = time.time()
         ok = str(r.get("code")) == "SSO10001"
         hit += ok
-        print("%2d) OCR=%-6s conf=%.2f -> %s %s" % (i + 1, code, rec.get("conf", 0),
-                                                    r.get("code"), "HIT" if ok else ""), flush=True)
+        t_net.append((t1 - t0) + (t3 - t2))
+        print("%2d) OCR=%-6s conf=%.2f -> %s %s | 拉图%.2fs OCR%.2fs 登录%.2fs" % (
+            i + 1, code, rec.get("conf", 0), r.get("code"), "HIT" if ok else "",
+            t1 - t0, t2 - t1, t3 - t2), flush=True)
         time.sleep(1.2)
-    print("命中: %d/%d = %.0f%%" % (hit, N, 100.0 * hit / max(1, N)))
+    p = hit / max(1, N)
+    net_avg = sum(t_net) / max(1, len(t_net))
+    print("命中: %d/%d = %.0f%% | 网络均值 %.2fs | 单次期望时间≈(OCR+%.2f)/%.0f%%" % (
+        hit, N, 100.0 * p, net_avg, net_avg, 100.0 * p))
 
 
 if __name__ == "__main__":
