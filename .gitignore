@@ -5,8 +5,25 @@ desktop.ini
 *.crx
 *.pem
 
-# 采集样本与训练产物（可由 tools/fetch_samples.py 重新采集生成）
+# lab 训练管线：忽略大数据与临时产物（代码进仓库）
+lab/data/dataset.npz
+lab/data/parity_*.raw
+lab/data/cnn_weights.npz
+lab/__pycache__/
+lab/*.log
+lab/bundle.js
+lab/login.html
+
+# 构建产物（dist 与签名密钥不进仓库）
+dist/
+
+# 整图样本与训练产物（可由 lab/harvest2.py 重新采集生成）
+lab/samples/
+lab/output/
+
+# 本地样本/训练产物（保留在磁盘，不入库；历史归档见本地分支 local-data-archive）
 samples/
 output/
+
+# Python 缓存
 __pycache__/
-*.pyc

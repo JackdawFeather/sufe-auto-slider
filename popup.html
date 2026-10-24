@@ -14,7 +14,7 @@
   }
   h3 { margin: 0 0 10px; font-size: 15px; color: #1c3f94; }
   label { display: block; margin: 10px 0 4px; color: #555; font-size: 12px; }
-  input[type="text"], input[type="password"] {
+  input[type="text"], input[type="password"], select {
     width: 100%;
     box-sizing: border-box;
     padding: 6px 8px;
@@ -22,6 +22,15 @@
     border-radius: 6px;
     font: inherit;
   }
+  select { background: #fff; }
+  .pwd-wrap { position: relative; }
+  .pwd-wrap input { padding-right: 54px; }
+  .pwd-toggle {
+    position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+    flex: none; width: auto; padding: 2px 8px; font-size: 11px;
+    border: none; background: transparent; color: #1c3f94; cursor: pointer;
+  }
+  .pwd-toggle:hover { background: transparent; text-decoration: underline; }
   .row { display: flex; align-items: center; gap: 6px; margin: 12px 0 4px; font-size: 12px; color: #555; }
   .btns { display: flex; gap: 8px; margin-top: 14px; }
   button {
@@ -35,16 +44,9 @@
   }
   button.primary { background: #1c3f94; border-color: #1c3f94; color: #fff; }
   button.primary:hover { background: #16347a; }
-  .pwd-wrap { position: relative; }
-  .pwd-wrap input { padding-right: 54px; }
-  .pwd-toggle {
-    position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
-    flex: none; width: auto; padding: 2px 8px; font-size: 11px;
-    border: none; background: transparent; color: #1c3f94; cursor: pointer;
-  }
-  .pwd-toggle:hover { background: transparent; text-decoration: underline; }
   #status { margin-top: 10px; font-size: 12px; color: #1a7f37; white-space: pre-wrap; word-break: break-all; }
   #status.err { color: #c0392b; }
+  #stats { margin-top: 6px; font-size: 11px; color: #98a1ad; }
   .tip { margin-top: 12px; font-size: 11px; color: #98a1ad; line-height: 1.5; }
 </style>
 </head>
@@ -65,18 +67,30 @@
   <label for="enabled" style="margin:0">自动登录：检测到上财登录页时自动过滑块并登录</label>
 </div>
 
+<label for="trigger">触发方式</label>
+<select id="trigger">
+  <option value="click">点击页面「登录」按钮触发</option>
+  <option value="auto">倒计时自动触发</option>
+</select>
+
+<label for="captchaMode">验证码方式</label>
+<select id="captchaMode">
+  <option value="vcode">字符验证码（图片，默认）</option>
+  <option value="slider">滑块（拼图）</option>
+</select>
+
 <div class="btns">
-  <button id="login" class="primary">登录</button>
-  <button id="save">保存</button>
+  <button id="save" class="primary">保存</button>
+  <button id="login">登录</button>
   <button id="test">测试滑块</button>
 </div>
 
 <div id="status"></div>
+<div id="stats"></div>
 
 <div class="tip">
-  「登录」：在上财登录页标签页点击，立即触发登录；页面里还没有扩展脚本时会自动注入，无需刷新。<br>
-  「测试滑块」：只验证滑块可用性，不提交账号（滑块由内置 CNN 从背景图定位缺口，纯本地推理）。<br>
-  进入登录页后约 1.5 秒自动登录；期间在表单里点击或打字即取消。
+  「登录」= 当场执行（免刷新注入）；「测试滑块」只验证滑块、不提交账号。<br>
+  触发：点页面「登录」后扩展接管，或选「倒计时自动」。验证码默认字符（图片）；遇到滑块请在这里切换。
 </div>
 
 <script src="popup.js"></script>
