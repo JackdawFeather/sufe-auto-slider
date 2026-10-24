@@ -73,6 +73,12 @@
   <option value="auto">倒计时自动触发</option>
 </select>
 
+<label for="captchaMode">验证码方式</label>
+<select id="captchaMode">
+  <option value="vcode">字符验证码（图片，默认）</option>
+  <option value="slider">滑块（拼图）</option>
+</select>
+
 <div class="btns">
   <button id="save" class="primary">保存</button>
   <button id="login">登录</button>
@@ -84,7 +90,7 @@
 
 <div class="tip">
   「登录」= 当场执行（免刷新注入）；「测试滑块」只验证滑块、不提交账号。<br>
-  触发：点页面「登录」后扩展接管，或选「倒计时自动」。凭据：优先用页面输入框，为空则自动填入这里保存的学号密码。
+  触发：点页面「登录」后扩展接管，或选「倒计时自动」。验证码默认字符（图片）；遇到滑块请在这里切换。
 </div>
 
 <script src="popup.js"></script>

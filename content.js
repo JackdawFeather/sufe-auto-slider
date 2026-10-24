@@ -7,9 +7,9 @@
  *   auto：检测到登录页后倒计时 2 秒自动登录（点击/打字可取消）。
  * 凭据以页面输入框为准：已有值（浏览器密码管理器填充/手动输入）直接采用、不覆盖；
  * 为空则把扩展保存的学号密码自动填入登录框后再登录。
- * 验证码两种模式（服务端按会话下发，自动检测）：
- *   slidercaptcha：拖动拼图（init → 分割/CNN 定位 → check）
- *   vcode：图片验证码（getRandcode → 纯 JS OCR → 随 doLogin 提交，错码自动换图重试）
+ * 验证码模式两种（弹窗「验证码方式」切换）：
+ *   vcode（默认）：图片验证码（getRandcode → 纯 JS OCR → 随 doLogin 提交，错码自动换图重试）
+ *   slider：拖动拼图（init → 分割/CNN 定位 → check）
  *
  * 滑块策略（整图 CNN + 邻域梯队）：
  *   背景图整图 → sufe-cnn.js（纯 JS 前向）预测「可通过窗口中心」X；先试 0/±1/±2，
@@ -311,7 +311,7 @@
       ui.note('doLogin 未通过：code=' + (res.code || '?') + ' msg=' + (res.msg || ''));
       await sleep(1500);
     }
-    throw new Error('图片验证码连续 ' + VCODE_MAX_ROUNDS + ' 轮未通过，请稍后再试或手动登录');
+    throw new Error('图片验证码连续 ' + VCODE_MAX_ROUNDS + ' 轮未通过，可在扩展设置中改用「滑块」或稍后重试');
   }
 
   async function autoLogin(cfg, ui, runId) {
@@ -324,8 +324,8 @@
     if (!param || !param.publicKey || !ticket) throw new Error('获取登录配置失败（接口结构可能已变化）');
     checkStop();
 
-    const wla = cfgRes.data.login && cfgRes.data.login.webLocalAuth;
-    if (wla && (String(wla.displayVcode) === '1' || String(wla.type) === 'vcode')) {
+    const useSlider = cfg && cfg.captchaMode === 'slider';
+    if (!useSlider) {
       return await vcodeLogin(cfg, param, ticket, ui, runId);
     }
 

@@ -218,7 +218,7 @@ async function main() {
     const pop = await newPage('chrome-extension://' + ext.id + '/popup.html');
     await browser.waitFor(pop.sid, "document.readyState === 'complete' ? 'ok' : ''", 15000);
     const setRes = await browser.eval(pop.sid,
-      "chrome.storage.local.set({sufeAutoSliderCfg:{username:'smoke-test',password:'x',enabled:true}}).then(() => 'ok')", true);
+      "chrome.storage.local.set({sufeAutoSliderCfg:{username:'smoke-test',password:'x',enabled:true,captchaMode:'slider'}}).then(() => 'ok')", true);
     check('注入测试配置', setRes === 'ok');
     await browser.cmd('Target.closeTarget', { targetId: pop.targetId });
 
@@ -280,12 +280,12 @@ async function main() {
     const cdAuto = await browser.waitFor(p2.sid, WIDGET + ".includes('秒后自动登录') ? 'yes' : ''", 10000);
     check('auto 模式回归：替身页出现倒计时卡片', !!cdAuto);
 
-    // 7) 图片验证码模式（mock）：displayVcode=1 → 拉图 OCR → 首次 SSO10023 换图重试 → SSO10001
-    //    先把触发方式切回 click（步骤 6 改成了 auto）
+    // 7) 图片验证码模式（默认）：删掉 captchaMode → 走默认 vcode；拉图 OCR → 首次 SSO10023 换图重试 → SSO10001
+    //    先把触发方式切回 click（步骤 6 改成了 auto），并删除 captchaMode 键验证默认行为
     const pop3 = await newPage('chrome-extension://' + ext.id + '/popup.html');
     await browser.waitFor(pop3.sid, "document.readyState === 'complete' ? 'ok' : ''", 15000);
     await browser.eval(pop3.sid,
-      "chrome.storage.local.get('sufeAutoSliderCfg').then(o => { const c = o.sufeAutoSliderCfg; c.triggerMode = 'click'; return chrome.storage.local.set({sufeAutoSliderCfg: c}); }).then(() => 'ok')", true);
+      "chrome.storage.local.get('sufeAutoSliderCfg').then(o => { const c = o.sufeAutoSliderCfg; c.triggerMode = 'click'; delete c.captchaMode; return chrome.storage.local.set({sufeAutoSliderCfg: c}); }).then(() => 'ok')", true);
     await browser.cmd('Target.closeTarget', { targetId: pop3.targetId });
     vcodeMode = true;
     await browser.cmd('Page.navigate', { url: FAKE_URL }, p2.sid);

@@ -16,6 +16,7 @@ const $password = document.getElementById('password');
 const $togglePwd = document.getElementById('togglePwd');
 const $enabled = document.getElementById('enabled');
 const $trigger = document.getElementById('trigger');
+const $captchaMode = document.getElementById('captchaMode');
 const $save = document.getElementById('save');
 const $login = document.getElementById('login');
 const $test = document.getElementById('test');
@@ -33,6 +34,7 @@ chrome.storage.local.get(CFG_KEY).then((o) => {
   $password.value = cfg.password || '';
   $enabled.checked = cfg.enabled !== false;
   $trigger.value = cfg.triggerMode === 'auto' ? 'auto' : 'click';
+  $captchaMode.value = cfg.captchaMode === 'slider' ? 'slider' : 'vcode';
 });
 
 chrome.storage.local.get('sufeAutoSliderStats').then((o) => {
@@ -55,6 +57,7 @@ $save.addEventListener('click', async () => {
     password: $password.value,
     enabled: $enabled.checked,
     triggerMode: $trigger.value,
+    captchaMode: $captchaMode.value,
   };
   if (!cfg.username || !cfg.password) {
     setStatus('请填写学号和密码。', true);
