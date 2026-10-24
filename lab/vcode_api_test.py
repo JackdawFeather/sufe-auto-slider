@@ -46,9 +46,15 @@ def do_login(code):
 
 
 def main():
-    hit = 0
+    CONF_MIN = 0.85      # 与 content.js 的 VCODE_CONF_MIN 一致
+    REFETCH_MAX = 3
+    hit = submissions = refetches = 0
     t_net = []
+    t_ocr = []
+    e2e = []             # 每次成功前累计耗时（含换图重识别）
+    since = time.time()
     for i in range(N):
+        # 一轮 = 拉图 + OCR（+ 视情况提交）
         t0 = time.time()
         img = S.get(BASE + "/api/v1/image/getRandcode?" + str(random.random()), timeout=20).content
         arr = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
@@ -64,21 +70,33 @@ def main():
         try:
             rec = json.loads(out)
         except Exception:
-            rec = {"text": "", "conf": 0}
-        code = rec["text"]
-        r = do_login(code) if code else {"code": "EMPTY"}
+            rec = {"text": "", "conf": 0, "ms": 0}
+        t_ocr.append(rec.get("ms", 0) / 1000.0)
+        if rec["conf"] < CONF_MIN and refetches < REFETCH_MAX:
+            refetches += 1
+            t_net.append((t1 - t0) + (t2 - t1))
+            print("%2d) 低置信 %.2f 换图重识别（%d/%d）" % (i + 1, rec["conf"], refetches, REFETCH_MAX), flush=True)
+            time.sleep(0.5)
+            continue
+        submissions += 1
+        r = do_login(rec["text"]) if rec["text"] else {"code": "EMPTY"}
         t3 = time.time()
         ok = str(r.get("code")) == "SSO10001"
         hit += ok
         t_net.append((t1 - t0) + (t3 - t2))
-        print("%2d) OCR=%-6s conf=%.2f -> %s %s | 拉图%.2fs OCR%.2fs 登录%.2fs" % (
-            i + 1, code, rec.get("conf", 0), r.get("code"), "HIT" if ok else "",
-            t1 - t0, t2 - t1, t3 - t2), flush=True)
-        time.sleep(1.2)
-    p = hit / max(1, N)
-    net_avg = sum(t_net) / max(1, len(t_net))
-    print("命中: %d/%d = %.0f%% | 网络均值 %.2fs | 单次期望时间≈(OCR+%.2f)/%.0f%%" % (
-        hit, N, 100.0 * p, net_avg, net_avg, 100.0 * p))
+        print("%2d) OCR=%-6s conf=%.2f -> %s %s | OCR %.0fms 网络 %.2fs" % (
+            i + 1, rec["text"], rec["conf"], r.get("code"), "HIT" if ok else "",
+            rec.get("ms", 0), (t1 - t0) + (t3 - t2)), flush=True)
+        if ok:
+            e2e.append(time.time() - since)
+            since = time.time()
+        time.sleep(1.0)
+    p = hit / max(1, submissions)
+    print("提交 %d 次，命中 %d（%.0f%%）| 换图重识别 %d 次 | OCR均值 %.0fms | 网络均值 %.2fs" % (
+        submissions, hit, 100.0 * p, refetches, 1000 * sum(t_ocr) / max(1, len(t_ocr)),
+        sum(t_net) / max(1, len(t_net))))
+    if e2e:
+        print("实测「每次通过耗时」均值 %.2fs（含 node 启动开销，浏览器内应更低）" % (sum(e2e) / len(e2e)))
 
 
 if __name__ == "__main__":

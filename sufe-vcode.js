@@ -86,33 +86,40 @@ var SufeVcode = (function () {
     return { data: out, w: dw, h: dh };
   }
 
-  // k x k 卷积（zero pad），平面布局 c*H*W
+  // k x k 卷积（zero pad），平面布局 c*H*W。scatter 累加（ic/kx/ky 外循环）以提升缓存局部性。
   function conv(src, sw, sh, cin, L) {
     var cout = L.cout, k = L.k, half = (k - 1) >> 1;
-    var dst = new Float32Array(cout * sw * sh);
-    for (var oc = 0; oc < cout; oc++) {
-      var wOff = oc * cin * k * k, b = L.b[oc];
-      var dBase = oc * sw * sh;
-      for (var y = 0; y < sh; y++) {
-        for (var x = 0; x < sw; x++) {
-          var sum = b;
-          for (var ic = 0; ic < cin; ic++) {
-            var wBase = wOff + ic * k * k;
-            var sBase = ic * sw * sh;
-            for (var ky = 0; ky < k; ky++) {
-              var sy = y + ky - half;
-              if (sy < 0 || sy >= sh) continue;
-              for (var kx = 0; kx < k; kx++) {
-                var sx = x + kx - half;
-                if (sx < 0 || sx >= sw) continue;
-                sum += L.w[wBase + ky * k + kx] * src[sBase + sy * sw + sx];
-              }
+    var n = sw * sh;
+    var dst = new Float32Array(cout * n);
+    for (var oc0 = 0; oc0 < cout; oc0++) {
+      var b0 = L.b[oc0], off0 = oc0 * n;
+      for (var i = 0; i < n; i++) dst[off0 + i] = b0;
+    }
+    for (var ic = 0; ic < cin; ic++) {
+      var sOff = ic * n;
+      for (var ky = 0; ky < k; ky++) {
+        var dy0 = half - ky; if (dy0 < 0) dy0 = 0;
+        var dy1 = sh + half - ky; if (dy1 > sh) dy1 = sh;
+        for (var kx = 0; kx < k; kx++) {
+          var dx0 = half - kx; if (dx0 < 0) dx0 = 0;
+          var dx1 = sw + half - kx; if (dx1 > sw) dx1 = sw;
+          if (dy0 >= dy1 || dx0 >= dx1) continue;
+          var wOff = ic * k * k + ky * k + kx;
+          for (var oc = 0; oc < cout; oc++) {
+            var w = L.w[oc * cin * k * k + wOff];
+            if (w === 0) continue;
+            var dOff = oc * n;
+            for (var y = dy0; y < dy1; y++) {
+              var sRow = sOff + (y + ky - half) * sw;
+              var dRow = dOff + y * sw;
+              for (var x = dx0; x < dx1; x++) dst[dRow + x] += w * src[sRow + x + kx - half];
             }
           }
-          if (L.relu && sum < 0) sum = 0;
-          dst[dBase + y * sw + x] = sum;
         }
       }
+    }
+    if (L.relu) {
+      for (var q = 0; q < dst.length; q++) if (dst[q] < 0) dst[q] = 0;
     }
     return dst;
   }
@@ -174,12 +181,16 @@ var SufeVcode = (function () {
       }
     }
     // 此时 feat = 96 x fw；按 4 个字符位置分箱，每箱列向 max → 96 维向量 → 线性头 → softmax
+    // 概率决策：0/o 形近且在置信区间内 → 按先验（0 明显多于 o）取 0；同时返回联合置信度供上层门控
     var bins = (META.bins || 4), nclass = HEAD.cout, charset = META.charset;
     var bw = (fw / bins) | 0;
     var convW = HEAD.w, convB = HEAD.b;
+    var O_CHAR = 24, ZERO_CHAR = 10;   // charset 中 'o' / '0' 的下标（"0123456789abcdefghijklmnopqrstuvwxyz"）
+    var OZ_DELTA = 0.12;               // 置信区间：概率差在此以内视为 0/o 歧义
     var text = '', confSum = 0;
     var vec = new Float32Array(HEAD.cin);
     var logits = new Float32Array(nclass);
+    var probs = new Float32Array(nclass);
     for (var bi = 0; bi < bins; bi++) {
       var lo = bi * bw, hi = bi < bins - 1 ? (bi + 1) * bw : fw;
       for (var ci = 0; ci < HEAD.cin; ci++) {
@@ -198,12 +209,22 @@ var SufeVcode = (function () {
         if (s > bestV) { bestV = s; bestI = oc; }
       }
       var sum = 0;
-      for (var q = 0; q < nclass; q++) sum += Math.exp(logits[q] - bestV);
-      confSum += 1 / sum;
+      for (var q = 0; q < nclass; q++) { probs[q] = Math.exp(logits[q] - bestV); sum += probs[q]; }
+      var pBest = 0;
+      for (var q2 = 0; q2 < nclass; q2++) probs[q2] /= sum;
+      pBest = probs[bestI];
+      confSum += pBest;
       var ch = charset.charAt(bestI);
+      // 0/o 歧义：落在置信区间内 → 按先验取 '0'
+      if (charset === '0123456789abcdefghijklmnopqrstuvwxyz' &&
+          ((bestI === O_CHAR && probs[ZERO_CHAR] > 0) || (bestI === ZERO_CHAR && probs[O_CHAR] > 0))) {
+        var other = bestI === O_CHAR ? ZERO_CHAR : O_CHAR;
+        if (pBest - probs[other] <= OZ_DELTA) ch = '0';
+      }
       if (ch) text += ch;
     }
-    return { text: text, conf: confSum / bins };
+    var conf = bins ? confSum / bins : 0;
+    return { text: text, conf: conf };
   }
 
   return { recognize: recognize, load: load };

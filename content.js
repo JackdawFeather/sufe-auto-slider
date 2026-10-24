@@ -29,7 +29,9 @@
   // WebVPN 代理域名（*.webvpn.sufe.edu.cn）下同样以页面自身域名走代理
   const BASE = location.origin + '/esc-sso';
   const MAX_ROUNDS = 6;
-  const VCODE_MAX_ROUNDS = 6;      // 图片验证码模式：换图重试轮数（单次实测约 62%，6 轮约 99.7%）
+  const VCODE_MAX_ROUNDS = 6;      // 图片验证码模式：提交轮数（实测单次约 75%）
+  const VCODE_CONF_MIN = 0.85;     // 低于此置信度先换图重识别，不浪费提交（概率决策）
+  const VCODE_REFETCH_MAX = 3;     // 低置信换图重识别的最多次数
   const AUTO_DELAY_MS = 2000;      // auto 模式：检测到登录页后的倒计时（保留短暂取消窗口）
   const LOOP_GUARD_MS = 20000;     // 自动登录成功后 20s 内不再自动启动（防死循环）
   const CFG_KEY = 'sufeAutoSliderCfg';
@@ -268,26 +270,39 @@
   }
 
   // 图片验证码模式：拉图 → 纯 JS OCR → 登录；SSO10023（验证码错误）换图重试
+  // 概率决策：识别置信度低于 VCODE_CONF_MIN 时先换图重识别（不计提交轮次），减少无效提交
   async function vcodeLogin(cfg, param, ticket, ui, runId) {
     const checkStop = () => { if (runId !== currentRunId) throw new Error('已停止'); };
-    for (let rnd = 1; rnd <= VCODE_MAX_ROUNDS; rnd++) {
+    let submitted = 0, refetched = 0, steps = 0;
+    while (submitted < VCODE_MAX_ROUNDS) {
       checkStop();
-      ui.status('图片验证码识别中（第 ' + rnd + '/' + VCODE_MAX_ROUNDS + ' 轮）…');
+      if (++steps > VCODE_MAX_ROUNDS + VCODE_REFETCH_MAX + 4) {
+        throw new Error('图片验证码多次尝试未通过，可在扩展设置中改用「滑块」或稍后重试');
+      }
+      ui.status('图片验证码识别中（第 ' + (submitted + 1) + '/' + VCODE_MAX_ROUNDS + ' 轮）…');
       let rec = null;
       try {
         const img = await fetchRandcode();
         rec = SufeVcode.recognize(img.data, img.width, img.height);
       } catch (e) {
         ui.note('验证码识别失败：' + e.message);
-        await sleep(backoff(rnd));
+        await sleep(600);
         continue;
       }
       if (!rec || !rec.text || rec.text.length < 3) {
         ui.note('识别结果异常（' + ((rec && rec.text) || '空') + '），换图重试');
-        await sleep(600);
+        await sleep(500);
         continue;
       }
-      ui.note('验证码识别为 ' + rec.text + '（' + Math.round(rec.conf * 100) + '%）');
+      const confPct = Math.round(rec.conf * 100);
+      if (rec.conf < VCODE_CONF_MIN && refetched < VCODE_REFETCH_MAX) {
+        refetched++;
+        ui.note('置信度偏低（' + confPct + '%），换图重识别（' + refetched + '/' + VCODE_REFETCH_MAX + '）');
+        await sleep(250);
+        continue;
+      }
+      ui.note('验证码识别为 ' + rec.text + '（' + confPct + '%）');
+      submitted++;
       checkStop();
       ui.status('正在登录…');
       const res = await submitLogin(cfg, param, ticket, rec.text);
@@ -298,7 +313,7 @@
       }
       if (String(res.code) === 'SSO10023') {
         ui.note('验证码未通过，换图重试');
-        await sleep(700);
+        await sleep(500);
         continue;
       }
       if (res.code === 'SSO10002' || res.code === 'SSO10001') {
@@ -309,7 +324,7 @@
         throw err;
       }
       ui.note('doLogin 未通过：code=' + (res.code || '?') + ' msg=' + (res.msg || ''));
-      await sleep(1500);
+      await sleep(1200);
     }
     throw new Error('图片验证码连续 ' + VCODE_MAX_ROUNDS + ' 轮未通过，可在扩展设置中改用「滑块」或稍后重试');
   }
