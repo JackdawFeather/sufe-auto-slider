@@ -14,7 +14,6 @@ function isLoginPageUrl(url) {
 const $username = document.getElementById('username');
 const $password = document.getElementById('password');
 const $togglePwd = document.getElementById('togglePwd');
-const $enabled = document.getElementById('enabled');
 const $trigger = document.getElementById('trigger');
 const $captchaMode = document.getElementById('captchaMode');
 const $save = document.getElementById('save');
@@ -32,7 +31,6 @@ chrome.storage.local.get(CFG_KEY).then((o) => {
   const cfg = o[CFG_KEY] || {};
   $username.value = cfg.username || '';
   $password.value = cfg.password || '';
-  $enabled.checked = cfg.enabled !== false;
   $trigger.value = cfg.triggerMode === 'auto' ? 'auto' : 'click';
   $captchaMode.value = cfg.captchaMode === 'slider' ? 'slider' : 'vcode';
 });
@@ -55,7 +53,6 @@ $save.addEventListener('click', async () => {
   const cfg = {
     username: $username.value.trim(),
     password: $password.value,
-    enabled: $enabled.checked,
     triggerMode: $trigger.value,
     captchaMode: $captchaMode.value,
   };

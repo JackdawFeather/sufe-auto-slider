@@ -28,8 +28,8 @@
   // 同源接口基址：在 login.sufe.edu.cn 上即 https://login.sufe.edu.cn/esc-sso；
   // WebVPN 代理域名（*.webvpn.sufe.edu.cn）下同样以页面自身域名走代理
   const BASE = location.origin + '/esc-sso';
-  const MAX_ROUNDS = 6;
-  const VCODE_MAX_ROUNDS = 6;      // 图片验证码模式：提交轮数（实测单次约 75%）
+  const MAX_ROUNDS = 4;
+  const VCODE_MAX_ROUNDS = 4;      // 图片验证码模式：提交轮数（单次约 75%，4 轮约 99.6%）
   const AUTO_DELAY_MS = 2000;      // auto 模式：检测到登录页后的倒计时（保留短暂取消窗口）
   const LOOP_GUARD_MS = 20000;     // 自动登录成功后 20s 内不再自动启动（防死循环）
   const CFG_KEY = 'sufeAutoSliderCfg';
@@ -682,20 +682,6 @@
   if (st.lastAutoLoginAt && Date.now() - st.lastAutoLoginAt < LOOP_GUARD_MS) {
     renderCard('刚刚已完成自动登录，但页面仍停留在登录页。可能跳转异常，请手动登录或稍后重试。', [
       mkBtn('重新尝试', () => startFlow(), true),
-      mkBtn('关闭', hideWidget),
-    ]);
-    return;
-  }
-
-  if (cfg && cfg.enabled === false) {
-    renderCard('上财自动滑块：自动登录已停用。', [
-      mkBtn('本次登录', () => startFlow(), true),
-      mkBtn('启用', async () => {
-        const c = (await getCfg()) || {};
-        c.enabled = true;
-        await chrome.storage.local.set({ [CFG_KEY]: c });
-        startEntry(c);
-      }),
       mkBtn('关闭', hideWidget),
     ]);
     return;

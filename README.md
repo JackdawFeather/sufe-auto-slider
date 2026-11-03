@@ -24,7 +24,7 @@
 1. 打开 Chrome，地址栏输入 `chrome://extensions/`
 2. 右上角打开「**开发者模式**」
 3. 点左上角「**加载已解压的扩展程序**」，选择本仓库克隆下来的 `sufe-auto-slider` 文件夹（或从 [Releases](https://github.com/haohaoo3o/sufe-auto-slider/releases) 下载最新 `sufe-auto-slider-vX.Y.Z.zip` 解压后选择该文件夹）
-4. 点击工具栏扩展图标，填写学号、密码，勾选自动登录，点「保存」
+4. 点击工具栏扩展图标，填写学号、密码，点「保存」
 
 日常无需任何操作：被业务系统跳到登录页时会自动处理并跳回。
 
